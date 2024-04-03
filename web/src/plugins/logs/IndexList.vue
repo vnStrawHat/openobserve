@@ -66,7 +66,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
         id="fieldList"
         :rows-per-page-options="[]"
         :hide-bottom="
-          searchObj.data.stream.selectedStreamFields.length <= rowsPerPage || searchObj.data.stream.selectedStreamFields.length == 0
+          searchObj.data.stream.selectedStreamFields.length <= rowsPerPage ||
+          searchObj.data.stream.selectedStreamFields.length == 0
         "
       >
         <template #body-cell-name="props">
@@ -91,7 +92,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
                 :title="props.row.name"
               >
                 <div
-                  class="field_label full-width"
+                  class="field_label full-width flex items-center justify-between"
                   :data-test="`logs-field-list-item-${props.row.name}`"
                 >
                   <div
@@ -180,6 +181,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
               </div>
               <q-expansion-item
                 v-else
+                :key="searchObj.data.query"
                 dense
                 switch-toggle-side
                 :label="props.row.name"
@@ -199,7 +201,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
                     :data-test="`log-search-expand-${props.row.name}-field-btn`"
                   >
                     <div
-                      class="field_label full-width"
+                      class="field_label full-width flex items-center justify-between"
                       :data-test="`logs-field-list-item-${props.row.name}`"
                     >
                       <div
@@ -410,8 +412,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
             </template>
           </q-input>
           <q-tr v-if="searchObj.loadingStream == true">
-            <q-td colspan="100%" class="text-bold"
-style="opacity: 0.7">
+            <q-td colspan="100%" class="text-bold" style="opacity: 0.7">
               <div class="text-subtitle2 text-weight-bold">
                 <q-spinner-hourglass size="20px" />
                 {{ t("confirmDialog.loading") }}
@@ -478,6 +479,7 @@ export default defineComponent({
         values: { key: string; count: string }[];
       };
     }> = ref({});
+    const collapseMapper = ref({});
     const parser = new Parser();
 
     const streamTypes = [
@@ -892,7 +894,6 @@ $streamSelectorHeight: 44px;
       pointer-events: none;
       font-size: 0.825rem;
       position: relative;
-      display: inline;
       z-index: 2;
       left: 0;
       // text-transform: capitalize;
