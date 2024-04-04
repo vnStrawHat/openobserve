@@ -1,14 +1,11 @@
 <template>
-  <div>
+  <div class="running-queries-page">
     <q-table
       data-test="running-queries-table"
       ref="qTable"
       :rows="queries"
       :columns="columns"
       row-key="session_id"
-      :pagination="pagination"
-      :filter="filterQuery"
-      :filter-method="filterData"
       style="width: 100%"
     >
       <template #no-data>
@@ -52,13 +49,13 @@
         </q-td>
       </template>
 
-      <template #top="scope">
+      <template #top>
         <div class="flex justify-between items-center full-width">
           <div class="q-table__title" data-test="log-stream-title-text">
-            {{ t("logStream.header") }}
+            {{ t("queries.runningQueries") }}
           </div>
           <div class="flex items-start">
-            <div class="flex justify-between items-end q-px-md">
+            <!-- <div class="flex justify-between items-end q-px-md">
               <div
                 style="
                   border: 1px solid #cacaca;
@@ -86,15 +83,15 @@
                   >
                 </template>
               </div>
-            </div>
+            </div> -->
             <div data-test="streams-search-stream-input">
               <q-input
                 v-model="filterQuery"
                 borderless
                 filled
                 dense
-                class="q-ml-auto q-mb-xs no-border"
-                :placeholder="t('logStream.search')"
+                class="q-ml-auto q-mb-xs no-border search-input"
+                :placeholder="t('queries.search')"
               >
                 <template #prepend>
                   <q-icon name="search" />
@@ -135,18 +132,21 @@
 </template>
 
 <script lang="ts" setup>
-import { ref } from "vue";
 import ConfirmDialog from "@/components/ConfirmDialog.vue";
-import SearchService from "@/services/search";
-import { onBeforeMount } from "vue";
-import { useQuasar } from "quasar";
-import QTablePagination from "@/components/shared/grid/Pagination.vue";
+// import SearchService from "@/services/search";
+import { onBeforeMount, ref, type Ref } from "vue";
+// import { useQuasar, type QTableProps } from "quasar";
+// import QTablePagination from "@/components/shared/grid/Pagination.vue";
 import { useI18n } from "vue-i18n";
+import { outlinedDelete } from "@quasar/extras/material-icons-outlined";
+import NoData from "@/components/shared/grid/NoData.vue";
+import { timestampToTimezoneDate } from "@/utils/zincutils";
 import { useStore } from "vuex";
 
 const store = useStore();
 const queries = ref([
   {
+    "#": 1,
     session_id: "2eXewV09OrUO0BxXjvpZ0EQ6GAN",
     query_start_time: 1712055588728556,
     is_queue: false,
@@ -155,9 +155,10 @@ const queries = ref([
     stream_type: "logs",
     sql: "select * from 'default'",
     start_time: 1706429989000000,
-    end_time: 2706685707000000,
+    end_time: 1706429989005000,
   },
   {
+    "#": 2,
     session_id: "2eXewV09OrUO0BxXjvpZ0EQ6GEN",
     query_start_time: 1712055588728556,
     is_queue: false,
@@ -166,7 +167,7 @@ const queries = ref([
     stream_type: "logs",
     sql: "select * from 'default'",
     start_time: 1706429989000000,
-    end_time: 2706685707000000,
+    end_time: 1706429989050000,
   },
 ]);
 const deleteDialog = ref({
@@ -175,7 +176,7 @@ const deleteDialog = ref({
   message: "Are you sure you want to delete this running query?",
   data: null,
 });
-const qTable: any = ref(null);
+// const qTable: any = ref(null);
 const { t } = useI18n();
 
 const perPageOptions: any = [
@@ -197,7 +198,7 @@ const changePagination = (val: { label: string; value: any }) => {
 };
 const filterQuery = ref("");
 
-const q = useQuasar();
+// const q = useQuasar();
 
 const columns = ref<QTableProps["columns"]>([
   {
@@ -214,77 +215,84 @@ const columns = ref<QTableProps["columns"]>([
     sortable: true,
   },
   {
-    name: "session_id",
-    field: "session_id",
-    label: t("user.session_id"),
-    align: "left",
-    sortable: true,
-  },
-  {
     name: "org_id",
     field: "org_id",
-    label: t("user.org_id"),
+    label: t("organization.id"),
     align: "left",
     sortable: true,
   },
   {
-    name: "date",
-    field: "date",
-    label: t("user.date"),
+    name: "query_start_time",
+    label: t("queries.initiatedAt"),
     align: "left",
     sortable: true,
+    field: (row: any) =>
+      timestampToTimezoneDate(
+        row.query_start_time / 1000,
+        store.state.timezone,
+        "yyyy-MM-dd HH:mm:ss.SSS"
+      ),
+    prop: (row: any) =>
+      timestampToTimezoneDate(
+        row.query_start_time / 1000,
+        store.state.timezone,
+        "yyyy-MM-dd HH:mm:ss.SSS"
+      ),
   },
   {
     name: "query",
     field: "query",
-    label: t("search.query"),
+    label: t("queries.query"),
     align: "left",
     sortable: true,
   },
   {
     name: "stream_type",
     field: "stream_type",
-    label: t("logStream.streamType"),
+    label: t("alerts.streamType"),
     align: "left",
     sortable: true,
   },
   {
     name: "start_time",
-    field: "start_time",
-    label: t("search.start_time"),
+    label: t("common.startTime"),
     align: "left",
     sortable: true,
+    field: (row: any) =>
+      timestampToTimezoneDate(
+        row["start_time"] / 1000,
+        store.state.timezone,
+        "yyyy-MM-dd HH:mm:ss.SSS"
+      ),
+    prop: (row: any) =>
+      timestampToTimezoneDate(
+        row["start_time"] / 1000,
+        store.state.timezone,
+        "yyyy-MM-dd HH:mm:ss.SSS"
+      ),
   },
   {
     name: "end_time",
-    field: "end_time",
-    label: t("search.end_time"),
+    label: t("common.endTime"),
     align: "left",
     sortable: true,
-  },
-  {
-    name: "storage_size",
-    label: t("logStream.storageSize"),
-    field: (row: any) => formatSizeFromMB(row.storage_size),
-    align: "left",
-    sortable: true,
-    sort: (a, b, rowA, rowB) => {
-      return parseInt(rowA.storage_size) - parseInt(rowB.storage_size);
-    },
-  },
-  {
-    name: "compressed_size",
-    field: (row: any) => formatSizeFromMB(row.compressed_size),
-    label: t("logStream.compressedSize"),
-    align: "left",
-    sortable: true,
-    sort: (a, b, rowA, rowB) =>
-      parseInt(rowA.compressed_size) - parseInt(rowB.compressed_size),
+    field: (row: any) =>
+      timestampToTimezoneDate(
+        row["end_time"] / 1000,
+        store.state.timezone,
+        "yyyy-MM-dd HH:mm:ss.SSS"
+      ),
+    prop: (row: any) =>
+      timestampToTimezoneDate(
+        row["end_time"] / 1000,
+        store.state.timezone,
+        "yyyy-MM-dd HH:mm:ss.SSS"
+      ),
   },
   {
     name: "actions",
     field: "actions",
-    label: t("user.actions"),
+    label: t("common.actions"),
     align: "center",
   },
 ]);
@@ -363,9 +371,18 @@ const filterData = (rows: any, terms: any) => {
 };
 
 const confirmDeleteAction = (props) => {
+  console.log(props);
   deleteDialog.value.data = props.row.session_id;
   deleteDialog.value.show = true;
 };
 </script>
 
 <style scoped></style>
+
+<style lang="scss">
+.running-queries-page {
+  .search-input {
+    width: 400px;
+  }
+}
+</style>
