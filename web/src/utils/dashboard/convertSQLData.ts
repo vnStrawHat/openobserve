@@ -433,11 +433,8 @@ export const convertSQLData = (
   let chartMin: any = Infinity;
   let chartMax: any = -Infinity;
   if (
-    [
-      "shades",
-      "continuous-green-yellow-red",
-      "continuous-red-yellow-green",
-    ].includes(panelSchema?.config?.color?.mode)
+    ["shades"].includes(panelSchema?.config?.color?.mode) ||
+    panelSchema?.config?.color?.mode.startsWith("continuous")
   ) {
     // if heatmap then get min and max from z axis sql data
     if (panelSchema.type == "heatmap") {
