@@ -51,7 +51,8 @@
     "actions": "Actions",
     "type": "Type",
     "search": "Search",
-    "expand": "Expand"
+    "expand": "Expand",
+    "date": "Date"
   },
   "search": {
     "selectIndex": "Select Stream First",
@@ -824,5 +825,12 @@
     "description": "Description",
     "cron": "Cron Job",
     "cronExpression": "Cron expression"
+  },
+  "queries": {
+    "runningQueries": "Running Queries",
+    "search": "Search",
+    "sessionId": "Session ID",
+    "initiatedAt": "Initiated At",
+    "query": "Query"
   }
 }
