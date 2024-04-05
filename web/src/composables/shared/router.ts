@@ -77,17 +77,6 @@ const useRoutes = () => {
       },
     },
     {
-      path: "running_queries",
-      name: "running_queries",
-      component: RunningQueriesList,
-      meta: {
-        keepAlive: true,
-      },
-      beforeEnter(to: any, from: any, next: any) {
-        routeGuard(to, from, next);
-      },
-    },
-    {
       path: "logs",
       name: "logs",
       component: Search,
@@ -247,6 +236,17 @@ const useRoutes = () => {
           path: "general",
           name: "general",
           component: () => import("@/components/settings/General.vue"),
+          beforeEnter(to: any, from: any, next: any) {
+            routeGuard(to, from, next);
+          },
+        },
+        {
+          path: "running_queries",
+          name: "running_queries",
+          component: () => import("@/components/queries/RunningQueriesList.vue"),
+          meta: {
+            keepAlive: true,
+          },
           beforeEnter(to: any, from: any, next: any) {
             routeGuard(to, from, next);
           },
