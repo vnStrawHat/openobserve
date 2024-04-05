@@ -135,7 +135,7 @@
       maximized
       data-test="list-schema-dialog"
     >
-      <QueryList v-model="schemaData" />
+      <QueryList :schemaData="schemaData" />
     </q-dialog>
   </div>
 </template>
@@ -161,14 +161,11 @@ import QueryList from "@/components/queries/QueryList.vue";
 
 export default defineComponent({
   name: "RunningQueriesList",
-  components: { QueryList },
+  components: { QueryList, ConfirmDialog },
   setup() {
     const store = useStore();
-    const schemaData = ref({
-      session_id: "",
-      sql: "",
-      stream_type: "",
-    });
+    const schemaData = ref({});
+
     const loadingState = ref(false);
     const queries = ref([
       {
@@ -209,11 +206,11 @@ export default defineComponent({
     const listSchema = (props: any) => {
       console.log("listSchema");
 
-      console.log(props.row);
+      console.log(props, "props.row");
 
-      schemaData.value.session_id = props.row.session_id;
-      schemaData.value.sql = props.row.sql;
-      schemaData.value.stream_type = props.row.stream_type;
+      //pass whole props.row to schemaData
+      schemaData.value = props.row;
+
       showListSchemaDialog.value = true;
       console.log(
         schemaData.value,
@@ -221,14 +218,7 @@ export default defineComponent({
         "showListSchemaDialog.value",
         showListSchemaDialog.value
       );
-
-      // segment.track("Button Click", {
-      //   button: "Actions",
-      //   user_org: store.state.selectedOrganization.identifier,
-      //   user_id: store.state.userInfo.email,
-      //   stream_name: props.row.session_id,
-      //   page: "Settings",
-      // });
+      console.log("schemaData.value", schemaData.value);
     };
 
     const perPageOptions: any = [
@@ -447,7 +437,7 @@ export default defineComponent({
       changePagination,
       outlinedDelete,
       schemaData,
-      loadingState
+      loadingState,
     };
   },
 });

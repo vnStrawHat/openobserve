@@ -831,6 +831,7 @@
     "search": "Search",
     "sessionId": "Session ID",
     "initiatedAt": "Initiated At",
-    "query": "Query"
+    "query": "Query",
+    "queryList": "Query List"
   }
 }
