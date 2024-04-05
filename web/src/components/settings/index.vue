@@ -37,7 +37,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
             exact
             default
             name="queryManagement"
-            :to="'/settings/running_queries'"
+            :to="'/settings/query_management'"
             icon="query_stats"
             :label="t('settings.queryManagement')"
             content-class="tab_content"
@@ -89,14 +89,14 @@ export default defineComponent({
     onBeforeMount(() => {
       if (router.currentRoute.value.name == "settings") {
         settingsTab.value = "general";
-        router.push({ path: "/settings/running_queries" });
+        router.push({ path: "/settings/query_management" });
       }
     });
 
     // render general settings component
     onActivated(() => {
       settingsTab.value = "general";
-      router.push({ path: "/settings/running_queries" });
+      router.push({ path: "/settings/query_management" });
     });
 
     onUpdated(() => {

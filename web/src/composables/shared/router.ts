@@ -241,8 +241,8 @@ const useRoutes = () => {
           },
         },
         {
-          path: "running_queries",
-          name: "running_queries",
+          path: "query_management",
+          name: "query_management",
           component: () => import("@/components/queries/RunningQueriesList.vue"),
           meta: {
             keepAlive: true,

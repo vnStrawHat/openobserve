@@ -784,7 +784,7 @@
     "addToDashboard": "Add to dashboard"
   },
   "settings": {
-    "header": "Settings",
+    "header": "Management",
     "userKeyLabel": "User Key",
     "rumKeyLabel": "RUM Key",
     "newUserKeyBtnLbl": "Add User Key",
