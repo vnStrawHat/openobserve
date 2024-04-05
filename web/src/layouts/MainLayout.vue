@@ -354,6 +354,7 @@ import {
   outlinedDescription,
 } from "@quasar/extras/material-icons-outlined";
 import SlackIcon from "@/components/icons/SlackIcon.vue";
+import ManagementIcon from "@/components/icons/ManagementIcon.vue";
 import organizations from "@/services/organizations";
 import useStreams from "@/composables/useStreams";
 import { openobserveRum } from "@openobserve/browser-rum";
@@ -390,6 +391,7 @@ export default defineComponent({
     "q-select": QSelect,
     ThemeSwitcher,
     SlackIcon,
+    ManagementIcon,
   },
   methods: {
     navigateToDocs() {
@@ -533,7 +535,7 @@ export default defineComponent({
       },
       {
         title: t("menu.settings"),
-        icon: outlinedSettings,
+        iconComponent: markRaw(ManagementIcon),
         link: "/settings/",
         name: "settings",
       },

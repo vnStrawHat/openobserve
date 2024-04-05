@@ -132,7 +132,7 @@
     "docs": "Docs",
     "billings": "Billing",
     "rum": "Real User Monitoring",
-    "settings": "Settings",
+    "settings": "Management",
     "iam": "IAM",
     "report": "Reports"
   },
@@ -795,7 +795,8 @@
     "updateuserKey": "Update User Key",
     "id": "Id",
     "update": "Update",
-    "generalLabel": "General",
+    "generalLabel": "Settings",
+    "queryManagement": "Query Management",
     "apikeyLabel": "API Keys",
     "generalPageTitle": "General Settings",
     "scrapintervalLabel": "Scrape Interval (In Seconds) *",

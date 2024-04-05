@@ -36,6 +36,15 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
           <q-route-tab
             exact
             default
+            name="queryManagement"
+            :to="'/settings/general'"
+            icon="query_stats"
+            :label="t('settings.queryManagement')"
+            content-class="tab_content"
+          />
+          <q-route-tab
+            exact
+            default
             name="general"
             :to="'/settings/general'"
             :icon="outlinedSettings"
