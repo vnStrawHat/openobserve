@@ -36,7 +36,7 @@
             @click="listSchema(props)"
           />
           <q-btn
-            :icon="outlinedDelete"
+            :icon="outlinedStopCircle"
             :title="t('logStream.delete')"
             class="q-ml-xs"
             padding="sm"
@@ -84,7 +84,10 @@
                 </template>
               </div>
             </div> -->
-            <div data-test="streams-search-stream-input">
+            <div
+              data-test="streams-search-stream-input"
+              class="flex items-center"
+            >
               <q-input
                 v-model="filterQuery"
                 borderless
@@ -97,6 +100,16 @@
                   <q-icon name="search" />
                 </template>
               </q-input>
+              <q-btn
+                outline
+                class="dashboard-icons q-p-lg q-mx-sm"
+                size="sm"
+                no-caps
+                icon="refresh"
+                @click="refreshData"
+                data-test="running-queries-refresh-btn"
+              >
+              </q-btn>
             </div>
           </div>
         </div>
@@ -153,7 +166,7 @@ import {
 // import { useQuasar, type QTableProps } from "quasar";
 // import QTablePagination from "@/components/shared/grid/Pagination.vue";
 import { useI18n } from "vue-i18n";
-import { outlinedDelete } from "@quasar/extras/material-icons-outlined";
+import { outlinedStopCircle } from "@quasar/extras/material-icons-outlined";
 import NoData from "@/components/shared/grid/NoData.vue";
 import { timestampToTimezoneDate } from "@/utils/zincutils";
 import { useStore } from "vuex";
@@ -165,7 +178,10 @@ export default defineComponent({
   setup() {
     const store = useStore();
     const schemaData = ref({});
-
+    const refreshData = () => {
+      console.log("refreshing data");
+      getRunningQueries();
+    };
     const loadingState = ref(false);
     const queries = ref([
       {
@@ -332,6 +348,12 @@ export default defineComponent({
           ),
       },
       {
+        name: "duration",
+        field: "duration",
+        label: t("queries.duration"),
+        align: "center",
+      },
+      {
         name: "actions",
         field: "actions",
         label: t("common.actions"),
@@ -353,7 +375,7 @@ export default defineComponent({
       SearchService.get_running_queries()
         .then((response: any) => {
           console.log("response", response);
-          
+
           queries.value = response.data;
         })
         .catch((error: any) => {
@@ -435,9 +457,10 @@ export default defineComponent({
       showListSchemaDialog,
       filterQuery,
       changePagination,
-      outlinedDelete,
+      outlinedStopCircle,
       schemaData,
       loadingState,
+      refreshData,
     };
   },
 });

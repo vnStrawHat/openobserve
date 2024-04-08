@@ -832,6 +832,7 @@
     "sessionId": "Session ID",
     "initiatedAt": "Initiated At",
     "query": "Query",
-    "queryList": "Query List"
+    "queryList": "Query List",
+    "duration": "Duration"
   }
 }
