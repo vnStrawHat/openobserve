@@ -833,6 +833,8 @@
     "initiatedAt": "Initiated At",
     "query": "Query",
     "queryList": "Query List",
-    "duration": "Duration"
+    "duration": "Duration",
+    "status": "Status",
+    "cancelQuery": "Cancel Query"
   }
 }

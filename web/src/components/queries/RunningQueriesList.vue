@@ -26,7 +26,7 @@
         <q-td :props="props">
           <q-btn
             icon="list_alt"
-            :title="t('logStream.schemaHeader')"
+            :title="t('queries.queryList')"
             class="q-ml-xs"
             padding="sm"
             unelevated
@@ -36,12 +36,13 @@
             @click="listSchema(props)"
           />
           <q-btn
-            :icon="outlinedStopCircle"
-            :title="t('logStream.delete')"
+            :icon="outlinedCancel"
+            :title="t('queries.cancelQuery')"
             class="q-ml-xs"
             padding="sm"
             unelevated
             size="sm"
+            style="color: red"
             round
             flat
             @click="confirmDeleteAction(props)"
@@ -166,7 +167,7 @@ import {
 // import { useQuasar, type QTableProps } from "quasar";
 // import QTablePagination from "@/components/shared/grid/Pagination.vue";
 import { useI18n } from "vue-i18n";
-import { outlinedStopCircle } from "@quasar/extras/material-icons-outlined";
+import { outlinedCancel } from "@quasar/extras/material-icons-outlined";
 import NoData from "@/components/shared/grid/NoData.vue";
 import { timestampToTimezoneDate } from "@/utils/zincutils";
 import { useStore } from "vuex";
@@ -180,35 +181,55 @@ export default defineComponent({
     const schemaData = ref({});
     const refreshData = () => {
       console.log("refreshing data");
-      getRunningQueries();
+      // getRunningQueries();
     };
     const loadingState = ref(false);
     const queries = ref([
       {
         "#": 1,
-        session_id: "2eXewV09OrUO0BxXjvpZ0EQ6GAN",
-        query_start_time: 1712055588728556,
-        is_queue: false,
+        session_id: "2el7tMu7v6eH6pZX9hCBe3VG1Jb",
+        status: "processing",
+        created_at: 1712467524505545,
+        started_at: 1712467524517149,
         user_id: "root@example.com",
         org_id: "default",
         stream_type: "logs",
-        sql: "select * from 'default'",
-        start_time: 1706429989000000,
-        end_time: 1706429989005000,
+        query: {
+          sql: "select * from 'default'",
+          start_time: 1706429989000000,
+          end_time: 2706685707000000,
+        },
+        scan_stats: {
+          files: 2,
+          records: 23376,
+          original_size: 50,
+          compressed_size: 0,
+        },
       },
       {
         "#": 2,
-        session_id: "2eXewV09OrUO0BxXjvpZ0EQ6GEN",
-        query_start_time: 1712055588728556,
-        is_queue: false,
+        session_id: "2el7tMu7v6eH6pZX9hCBe3VG2NK",
+        status: "processing",
+        created_at: 1712467524505545,
+        started_at: 1712467524517149,
         user_id: "root@example.com",
         org_id: "default",
         stream_type: "logs",
-        sql: "select * from 'default'",
-        start_time: 1706429989000000,
-        end_time: 1706429989050000,
+        query: {
+          sql: "select * from 'default'",
+          start_time: 1706429989000000,
+          end_time: 2706685707000000,
+        },
+        scan_stats: {
+          files: 2,
+          records: 23376,
+          original_size: 50,
+          compressed_size: 0,
+        },
       },
     ]);
+    console.log(queries.value, "queries.value");
+
     const deleteDialog = ref({
       show: false,
       title: "Delete Running Query",
@@ -258,6 +279,44 @@ export default defineComponent({
 
     // const q = useQuasar();
 
+    const localTimeToMicroseconds = () => {
+      // Create a Date object representing the current local time
+      var date = new Date();
+
+      // Get the timestamp in milliseconds
+      var timestampMilliseconds = date.getTime();
+
+      // Convert milliseconds to microseconds
+      var timestampMicroseconds = timestampMilliseconds * 1000;
+
+      console.log(timestampMicroseconds, "------------");
+      return timestampMicroseconds;
+    };
+
+    // Test the function
+
+    const getDuration = (createdAt: number) => {
+      const currentTime = localTimeToMicroseconds();
+      console.log(currentTime, "currentTime", createdAt, "createdAt");
+
+      const durationInSeconds = Math.floor((currentTime - createdAt) / 1000000);
+
+      let formattedDuration;
+      if (durationInSeconds < 0) {
+        formattedDuration = "Invalid duration";
+      } else if (durationInSeconds < 60) {
+        formattedDuration = `${durationInSeconds}s`;
+      } else if (durationInSeconds < 3600) {
+        const minutes = Math.floor(durationInSeconds / 60);
+        formattedDuration = `${minutes}m`;
+      } else {
+        const hours = Math.floor(durationInSeconds / 3600);
+        formattedDuration = `${hours}h`;
+      }
+
+      return formattedDuration;
+    };
+
     const columns = ref<QTableProps["columns"]>([
       {
         name: "#",
@@ -280,27 +339,17 @@ export default defineComponent({
         sortable: true,
       },
       {
-        name: "query_start_time",
-        label: t("queries.initiatedAt"),
+        name: "duration",
+        label: t("queries.duration"),
         align: "left",
         sortable: true,
-        field: (row: any) =>
-          timestampToTimezoneDate(
-            row.query_start_time / 1000,
-            store.state.timezone,
-            "yyyy-MM-dd HH:mm:ss.SSS"
-          ),
-        prop: (row: any) =>
-          timestampToTimezoneDate(
-            row.query_start_time / 1000,
-            store.state.timezone,
-            "yyyy-MM-dd HH:mm:ss.SSS"
-          ),
+        field: (row: any) => getDuration(row.created_at),
+        prop: (row: any) => getDuration(row.created_at),
       },
       {
-        name: "query",
-        field: "query",
-        label: t("queries.query"),
+        name: "status",
+        field: "status",
+        label: t("queries.status"),
         align: "left",
         sortable: true,
       },
@@ -310,48 +359,6 @@ export default defineComponent({
         label: t("alerts.streamType"),
         align: "left",
         sortable: true,
-      },
-      {
-        name: "start_time",
-        label: t("common.startTime"),
-        align: "left",
-        sortable: true,
-        field: (row: any) =>
-          timestampToTimezoneDate(
-            row["start_time"] / 1000,
-            store.state.timezone,
-            "yyyy-MM-dd HH:mm:ss.SSS"
-          ),
-        prop: (row: any) =>
-          timestampToTimezoneDate(
-            row["start_time"] / 1000,
-            store.state.timezone,
-            "yyyy-MM-dd HH:mm:ss.SSS"
-          ),
-      },
-      {
-        name: "end_time",
-        label: t("common.endTime"),
-        align: "left",
-        sortable: true,
-        field: (row: any) =>
-          timestampToTimezoneDate(
-            row["end_time"] / 1000,
-            store.state.timezone,
-            "yyyy-MM-dd HH:mm:ss.SSS"
-          ),
-        prop: (row: any) =>
-          timestampToTimezoneDate(
-            row["end_time"] / 1000,
-            store.state.timezone,
-            "yyyy-MM-dd HH:mm:ss.SSS"
-          ),
-      },
-      {
-        name: "duration",
-        field: "duration",
-        label: t("queries.duration"),
-        align: "center",
       },
       {
         name: "actions",
@@ -457,7 +464,7 @@ export default defineComponent({
       showListSchemaDialog,
       filterQuery,
       changePagination,
-      outlinedStopCircle,
+      outlinedCancel,
       schemaData,
       loadingState,
       refreshData,

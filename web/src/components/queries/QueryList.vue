@@ -44,6 +44,8 @@
 import type { QTableProps } from "quasar";
 import { computed, defineComponent, ref } from "vue";
 import { useI18n } from "vue-i18n";
+import { timestampToTimezoneDate } from "@/utils/zincutils";
+import { useStore } from "vuex";
 
 export default defineComponent({
   name: "QueryList",
@@ -55,32 +57,82 @@ export default defineComponent({
   setup(props: any) {
     const { t } = useI18n();
     const queryData = props.metaData?.queries || [];
-
+    const store = useStore();
     const getRows = (query: any) => {
       console.log(query, "query");
 
-      const querystartTime = query?.query_start_time;
-      const formattedQueryStartTime = new Date(querystartTime / 1000);
-      const queryStartTimeEntry = `${querystartTime} (${formattedQueryStartTime})`;
+      //   const querystartTime = query?.query_start_time;
+      //   const formattedQueryStartTime = new Date(querystartTime / 1000);
+      //   const queryStartTimeEntry = `${querystartTime} (${formattedQueryStartTime})`;
 
-      const timestampOfStartTime = query?.start_time;
-      const formattedStartTime = new Date(timestampOfStartTime / 1000);
-      const startTimeEntry = `${timestampOfStartTime} (${formattedStartTime})`;
+      const timestampOfStartTime = query?.query?.start_time;
+      const formattedStartTime = timestampToTimezoneDate(
+        timestampOfStartTime / 1000,
+        store.state.timezone,
+        "yyyy-MM-dd HH:mm:ss"
+      );
+      const startTimeEntry = `${formattedStartTime} (${timestampOfStartTime})`;
 
-      const timestampOfEndTime = query?.end_time;
-      const formattedEndTime = new Date(timestampOfEndTime / 1000);
-      const endTimeEntry = `${timestampOfEndTime} (${formattedEndTime})`;
+      const timestampOfEndTime = query?.query?.end_time;
+      const formattedEndTime = timestampToTimezoneDate(
+        timestampOfEndTime / 1000,
+        store.state.timezone,
+        "yyyy-MM-dd HH:mm:ss"
+      );
+      const endTimeEntry = `${formattedEndTime} (${timestampOfEndTime})`;
+
+      const localTimeToMicroseconds = () => {
+        // Create a Date object representing the current local time
+        var date = new Date();
+
+        // Get the timestamp in milliseconds
+        var timestampMilliseconds = date.getTime();
+
+        // Convert milliseconds to microseconds
+        var timestampMicroseconds = timestampMilliseconds * 1000;
+
+        console.log(timestampMicroseconds, "------------");
+        return timestampMicroseconds;
+      };
+
+      const getDuration = (createdAt: number) => {
+        const currentTime = localTimeToMicroseconds();
+        console.log(currentTime, "currentTime", createdAt, "createdAt");
+
+        const durationInSeconds = Math.floor(
+          (currentTime - createdAt) / 1000000
+        );
+
+        let formattedDuration;
+        if (durationInSeconds < 0) {
+          formattedDuration = "Invalid duration";
+        } else if (durationInSeconds < 60) {
+          formattedDuration = `${durationInSeconds}s`;
+        } else if (durationInSeconds < 3600) {
+          const minutes = Math.floor(durationInSeconds / 60);
+          formattedDuration = `${minutes}m`;
+        } else {
+          const hours = Math.floor(durationInSeconds / 3600);
+          formattedDuration = `${hours}h`;
+        }
+
+        return formattedDuration;
+      };
 
       const rows: any[] = [
         ["Session ID", query?.session_id],
-        ["Query Start Time", queryStartTimeEntry],
-        ["Is Query Queue", query?.is_queue],
+        ["Status", query?.status],
         ["User ID", query?.user_id],
         ["Org ID", query?.org_id],
         ["Stream Type", query?.stream_type],
-        ["Sql", query?.sql],
+        ["Sql", query?.query?.sql],
         ["Start Time", startTimeEntry],
         ["End Time", endTimeEntry],
+        ["Duration", getDuration(query?.created_at)],
+        ["Scan Records", query?.scan_stats?.records],
+        ["Files", query?.scan_stats?.files],
+        ["Original Size", query?.scan_stats?.original_size],
+        ["Compressed Size", query?.scan_stats?.compressed_size],
       ];
 
       return rows;
