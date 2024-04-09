@@ -114,6 +114,11 @@
             </div>
           </div>
         </div>
+        <div class="label-container">
+          <label class="q-my-sm text-bold"
+            >Last Data Refresh Time: {{ lastRefreshed }}</label
+          >
+        </div>
         <q-table-pagination
           data-test="log-stream-table-pagination"
           :scope="scope"
@@ -179,10 +184,28 @@ export default defineComponent({
   setup() {
     const store = useStore();
     const schemaData = ref({});
+    const lastRefreshed = ref("");
+
     const refreshData = () => {
       console.log("refreshing data");
       // getRunningQueries();
+      lastRefreshed.value = getCurrentTime();
     };
+
+    // Function to get current time in a desired format
+    const getCurrentTime = () => {
+      const now = new Date();
+      const year = now.getFullYear().toString().padStart(4, "0");
+      const month = (now.getMonth() + 1).toString().padStart(2, "0");
+      const day = now.getDate().toString().padStart(2, "0");
+      const hours = now.getHours().toString().padStart(2, "0");
+      const minutes = now.getMinutes().toString().padStart(2, "0");
+      const seconds = now.getSeconds().toString().padStart(2, "0");
+      const timezone = store.state.timezone;
+
+      return `${year}-${month}-${day} ${hours}:${minutes}:${seconds} ${timezone}`;
+    };
+
     const loadingState = ref(false);
     const queries = ref([
       {
@@ -399,6 +422,7 @@ export default defineComponent({
 
     onBeforeMount(() => {
       // getRunningQueries();
+      lastRefreshed.value = getCurrentTime();
     });
 
     const getRunningQueries = () => {
@@ -497,12 +521,19 @@ export default defineComponent({
       schemaData,
       loadingState,
       refreshData,
+      lastRefreshed,
     };
   },
 });
 </script>
 
-<style scoped></style>
+<style scoped>
+.label-container {
+  display: flex;
+  width: 100%;
+  justify-content: flex-end;
+}
+</style>
 
 <style lang="scss">
 .running-queries-page {
