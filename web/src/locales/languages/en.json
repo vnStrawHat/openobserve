@@ -832,9 +832,11 @@
     "sessionId": "Session ID",
     "initiatedAt": "Initiated At",
     "query": "Query",
-    "queryList": "Query List",
-    "duration": "Duration",
+    "queryList": "Query Details",
+    "duration": "Exec. Duration",
     "status": "Status",
-    "cancelQuery": "Cancel Query"
+    "cancelQuery": "Cancel Query",
+    "queryRange": "Query Range",
+    "refreshQuery": "Refresh Query"
   }
 }

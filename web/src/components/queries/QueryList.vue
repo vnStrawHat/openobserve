@@ -119,6 +119,25 @@ export default defineComponent({
         return formattedDuration;
       };
 
+      //different between start and end time to show in UI as queryRange
+    const queryRange = (startTime: number, endTime: number) => {
+      const queryDuration = Math.floor((endTime - startTime) / 1000000);
+      let formattedDuration;
+      if (queryDuration < 0) {
+        formattedDuration = "Invalid duration";
+      } else if (queryDuration < 60) {
+        formattedDuration = `${queryDuration}s`;
+      } else if (queryDuration < 3600) {
+        const minutes = Math.floor(queryDuration / 60);
+        formattedDuration = `${minutes}m`;
+      } else {
+        const hours = Math.floor(queryDuration / 3600);
+        formattedDuration = `${hours}h`;
+      }
+
+      return formattedDuration;
+    };
+
       const rows: any[] = [
         ["Session ID", query?.session_id],
         ["Status", query?.status],
@@ -128,7 +147,8 @@ export default defineComponent({
         ["Sql", query?.query?.sql],
         ["Start Time", startTimeEntry],
         ["End Time", endTimeEntry],
-        ["Duration", getDuration(query?.created_at)],
+        ["Exec. Duration", getDuration(query?.created_at)],
+        ["Query Range", queryRange(query?.query?.start_time, query?.query?.end_time)],
         ["Scan Records", query?.scan_stats?.records],
         ["Files", query?.scan_stats?.files],
         ["Original Size", query?.scan_stats?.original_size],

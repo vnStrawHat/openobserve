@@ -102,15 +102,15 @@
                 </template>
               </q-input>
               <q-btn
-                outline
-                class="dashboard-icons q-p-lg q-mx-sm"
-                size="sm"
+                data-test="running-queries-refresh-btn"
+                class="q-ml-md q-mb-xs text-bold no-border"
+                padding="sm lg"
+                color="secondary"
                 no-caps
                 icon="refresh"
+                :label="t(`queries.refreshQuery`)"
                 @click="refreshData"
-                data-test="running-queries-refresh-btn"
-              >
-              </q-btn>
+              />
             </div>
           </div>
         </div>
@@ -217,8 +217,8 @@ export default defineComponent({
         stream_type: "logs",
         query: {
           sql: "select * from 'default'",
-          start_time: 1706429989000000,
-          end_time: 2706685707000000,
+          start_time: 1712672758000000,
+          end_time: 1712676358000000,
         },
         scan_stats: {
           files: 2,
@@ -317,6 +317,25 @@ export default defineComponent({
       return formattedDuration;
     };
 
+    //different between start and end time to show in UI as queryRange
+    const queryRange = (startTime: number, endTime: number) => {
+      const queryDuration = Math.floor((endTime - startTime) / 1000000);
+      let formattedDuration;
+      if (queryDuration < 0) {
+        formattedDuration = "Invalid duration";
+      } else if (queryDuration < 60) {
+        formattedDuration = `${queryDuration}s`;
+      } else if (queryDuration < 3600) {
+        const minutes = Math.floor(queryDuration / 60);
+        formattedDuration = `${minutes}m`;
+      } else {
+        const hours = Math.floor(queryDuration / 3600);
+        formattedDuration = `${hours}h`;
+      }
+
+      return formattedDuration;
+    };
+
     const columns = ref<QTableProps["columns"]>([
       {
         name: "#",
@@ -345,6 +364,16 @@ export default defineComponent({
         sortable: true,
         field: (row: any) => getDuration(row.created_at),
         prop: (row: any) => getDuration(row.created_at),
+      },
+      {
+        name: "queryRange",
+        label: t("queries.queryRange"),
+        align: "left",
+        sortable: true,
+        field: (row: any) =>
+          queryRange(row.query.start_time, row.query.end_time),
+        prop: (row: any) =>
+          queryRange(row.query.start_time, row.query.end_time),
       },
       {
         name: "status",
