@@ -144,7 +144,7 @@ export default defineComponent({
         ["User ID", query?.user_id],
         ["Org ID", query?.org_id],
         ["Stream Type", query?.stream_type],
-        ["Sql", query?.query?.sql],
+        ["SQL", query?.query?.sql],
         ["Start Time", startTimeEntry],
         ["End Time", endTimeEntry],
         ["Exec. Duration", getDuration(query?.created_at)],
