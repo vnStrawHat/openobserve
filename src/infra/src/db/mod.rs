@@ -1,4 +1,4 @@
-// Copyright 2023 Zinc Labs Inc.
+// Copyright 2024 Zinc Labs Inc.
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -23,12 +23,10 @@ use tokio::sync::{mpsc, OnceCell};
 
 use crate::errors::{DbError, Error, Result};
 
-pub mod dynamo;
 pub mod etcd;
 pub mod mysql;
 pub mod nats;
 pub mod postgres;
-pub mod sled;
 pub mod sqlite;
 
 pub static NEED_WATCH: bool = true;
@@ -56,15 +54,13 @@ async fn default() -> Box<dyn Db> {
     if !CONFIG.common.local_mode
         && (CONFIG.common.meta_store == "sled" || CONFIG.common.meta_store == "sqlite")
     {
-        panic!("cluster mode is not supported for ZO_META_STORE=sled/sqlite");
+        panic!("cluster mode is not supported for ZO_META_STORE=sqlite");
     }
 
     match CONFIG.common.meta_store.as_str().into() {
-        MetaStore::Sled => Box::<sled::SledDb>::default(),
         MetaStore::Sqlite => Box::<sqlite::SqliteDb>::default(),
         MetaStore::Etcd => Box::<etcd::Etcd>::default(),
         MetaStore::Nats => Box::<nats::NatsDb>::default(),
-        MetaStore::DynamoDB => Box::<dynamo::DynamoDb>::default(),
         MetaStore::MySQL => Box::<mysql::MysqlDb>::default(),
         MetaStore::PostgreSQL => Box::<postgres::PostgresDb>::default(),
     }
@@ -73,7 +69,7 @@ async fn default() -> Box<dyn Db> {
 async fn init_cluster_coordinator() -> Box<dyn Db> {
     if CONFIG.common.local_mode {
         match CONFIG.common.meta_store.as_str().into() {
-            MetaStore::Sled => Box::<sled::SledDb>::default(),
+            MetaStore::Sqlite => Box::<sqlite::SqliteDb>::default(),
             _ => Box::<sqlite::SqliteDb>::default(),
         }
     } else {
@@ -95,6 +91,9 @@ pub async fn create_table() -> Result<()> {
     Ok(())
 }
 
+pub type UpdateFn = dyn FnOnce(Option<Bytes>) -> Result<Option<(Option<Bytes>, Option<(String, Bytes, Option<i64>)>)>>
+    + Send;
+
 #[async_trait]
 pub trait Db: Sync + Send + 'static {
     async fn create_table(&self) -> Result<()>;
@@ -107,12 +106,19 @@ pub trait Db: Sync + Send + 'static {
         need_watch: bool,
         start_dt: Option<i64>,
     ) -> Result<()>;
+    async fn get_for_update(
+        &self,
+        key: &str,
+        need_watch: bool,
+        start_dt: Option<i64>,
+        update_fn: Box<UpdateFn>,
+    ) -> Result<()>;
     async fn delete(
         &self,
         key: &str,
         with_prefix: bool,
         need_watch: bool,
-        updated_at: Option<i64>,
+        start_dt: Option<i64>,
     ) -> Result<()>;
 
     /// Contrary to `delete`, this call won't fail if `key` is missing.
@@ -166,13 +172,15 @@ pub fn parse_key(mut key: &str) -> (String, String, String) {
     (module, key1, key2)
 }
 
-pub fn build_key(module: &str, key1: &str, key2: &str) -> String {
+pub fn build_key(module: &str, key1: &str, key2: &str, start_dt: i64) -> String {
     if key1.is_empty() {
         format!("/{module}/")
     } else if key2.is_empty() {
         format!("/{module}/{key1}")
-    } else {
+    } else if start_dt == 0 {
         format!("/{module}/{key1}/{key2}")
+    } else {
+        format!("/{module}/{key1}/{key2}/{start_dt}")
     }
 }
 
@@ -197,9 +205,11 @@ pub struct EventData {
 
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct MetaRecord {
+    pub id: i64,
     pub module: String,
     pub key1: String,
     pub key2: String,
+    pub start_dt: i64,
     pub value: String,
 }
 

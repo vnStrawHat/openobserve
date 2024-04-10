@@ -57,7 +57,6 @@ fn get_cors() -> Rc<Cors> {
 #[cfg(not(feature = "enterprise"))]
 fn get_cors() -> Rc<Cors> {
     let cors = Cors::default()
-        .send_wildcard()
         .allowed_methods(vec!["HEAD", "GET", "POST", "PUT", "OPTIONS", "DELETE"])
         .allowed_headers(vec![
             header::AUTHORIZATION,
@@ -65,6 +64,7 @@ fn get_cors() -> Rc<Cors> {
             header::CONTENT_TYPE,
         ])
         .allow_any_origin()
+        .supports_credentials()
         .max_age(3600);
     Rc::new(cors)
 }
@@ -195,7 +195,8 @@ pub fn get_config_routes(cfg: &mut web::ServiceConfig) {
             .service(status::zo_config)
             .service(status::redirect)
             .service(status::dex_login)
-            .service(status::refresh_token_with_dex),
+            .service(status::refresh_token_with_dex)
+            .service(status::logout),
     );
 }
 
@@ -262,6 +263,8 @@ pub fn get_service_routes(cfg: &mut web::ServiceConfig) {
             .service(prom::format_query_post)
             .service(enrichment_table::save_enrichment_table)
             .service(search::search)
+            .service(search::job::cancel_job)
+            .service(search::job::job_status)
             .service(search::search_partition)
             .service(search::around)
             .service(search::values)

@@ -1,4 +1,4 @@
-// Copyright 2023 Zinc Labs Inc.
+// Copyright 2024 Zinc Labs Inc.
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -32,7 +32,6 @@ use crate::{
     common::{
         infra::config::{STREAM_SCHEMAS, STREAM_SETTINGS},
         meta::{
-            self,
             authz::Authz,
             http::HttpResponse as MetaHttpResponse,
             prom,
@@ -242,16 +241,9 @@ pub async fn save_stream_settings(
             chrono::Utc::now().timestamp_micros().to_string(),
         );
     }
-    db::schema::set(
-        org_id,
-        stream_name,
-        stream_type,
-        &schema.clone().with_metadata(metadata),
-        None,
-        false,
-    )
-    .await
-    .unwrap();
+    db::schema::update_metadata(org_id, stream_name, stream_type, metadata)
+        .await
+        .unwrap();
 
     Ok(HttpResponse::Ok().json(MetaHttpResponse::message(
         http::StatusCode::OK.into(),
@@ -409,28 +401,11 @@ pub async fn delete_fields(
     if fields.is_empty() {
         return Ok(());
     }
-    let schema =
-        db::schema::get_from_db(org_id, stream_name, stream_type.unwrap_or_default()).await?;
-    let fields = schema
-        .all_fields()
-        .into_iter()
-        .filter_map(|f| {
-            if !fields.contains(f.name()) {
-                Some(f.clone())
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
-    let schema = Schema::new(fields);
-    let min_ts = chrono::Utc::now().timestamp_micros();
-    db::schema::set(
+    db::schema::delete_fields(
         org_id,
         stream_name,
         stream_type.unwrap_or_default(),
-        &schema,
-        Some(min_ts),
-        true,
+        fields.to_vec(),
     )
     .await?;
     Ok(())
@@ -466,20 +441,20 @@ async fn _get_stream_stats(
 
     // group by stream_name , org_id , stream_type
 
-    let query = meta::search::Query {
+    let query = config::meta::search::Query {
         sql: format!("{sql} group by stream_name , org_id , stream_type"),
         sql_mode: "full".to_owned(),
         size: 100000000,
         ..Default::default()
     };
 
-    let req: meta::search::Request = meta::search::Request {
+    let req = config::meta::search::Request {
         query,
         aggs: HashMap::new(),
-        encoding: meta::search::RequestEncoding::Empty,
+        encoding: config::meta::search::RequestEncoding::Empty,
         timeout: 0,
     };
-    match SearchService::search("", &CONFIG.common.usage_org, StreamType::Logs, &req).await {
+    match SearchService::search("", &CONFIG.common.usage_org, StreamType::Logs, None, &req).await {
         Ok(res) => {
             let mut all_stats = HashMap::new();
             for item in res.hits {

@@ -14,12 +14,7 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import { createRouter, createWebHistory } from "vue-router";
-import {
-  getDecodedUserInfo,
-  useLocalToken,
-  getPath,
-  mergeRoutes,
-} from "@/utils/zincutils";
+import { getDecodedUserInfo, getPath, mergeRoutes } from "@/utils/zincutils";
 import segment from "@/services/segment_analytics";
 import config from "@/aws-exports";
 
@@ -65,17 +60,16 @@ export default function (store: any) {
   router.beforeEach((to: any, from: any, next: any) => {
     const isAuthenticated = store.state.loggedIn;
 
-    if (!isAuthenticated) {
-      if (to.path == "/cb") {
-        next();
-      }
+    if (!isAuthenticated && (to.path == "/cb" || to.path == "/web/cb")) {
+      next();
+    } else if (!isAuthenticated) {
       const sessionUserInfo = getDecodedUserInfo();
 
-      const localStorageToken: any = useLocalToken();
       if (
         to.path !== "/login" &&
         to.path !== "/cb" &&
-        (localStorageToken.value === "" || sessionUserInfo === null)
+        to.path != "/web/cb" &&
+        sessionUserInfo === null
       ) {
         if (to.path !== "/logout") {
           window.sessionStorage.setItem("redirectURI", to.fullPath);

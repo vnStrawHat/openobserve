@@ -1,4 +1,4 @@
-// Copyright 2023 Zinc Labs Inc.
+// Copyright 2024 Zinc Labs Inc.
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -13,7 +13,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use config::{cluster, ider, utils::file::clean_empty_dirs, CONFIG, INSTANCE_ID};
+use config::{cluster, ider, utils::asynchronism::file::clean_empty_dirs, CONFIG, INSTANCE_ID};
 use infra::file_list as infra_file_list;
 #[cfg(feature = "enterprise")]
 use o2_enterprise::enterprise::common::infra::config::O2_CONFIG;
@@ -81,11 +81,11 @@ pub async fn init() -> Result<(), anyhow::Error> {
         .expect("organization cache sync failed");
 
     // set instance id
-    let instance_id = match db::get_instance().await {
+    let instance_id = match db::instance::get().await {
         Ok(Some(instance)) => instance,
         Ok(None) | Err(_) => {
             let id = ider::generate();
-            let _ = db::set_instance(&id).await;
+            let _ = db::instance::set(&id).await;
             id
         }
     };
@@ -188,7 +188,11 @@ pub async fn init() -> Result<(), anyhow::Error> {
             log::error!("Failed to create wal dir: {}", e);
         }
         // clean empty sub dirs
-        _ = clean_empty_dirs(&CONFIG.common.data_wal_dir);
+        tokio::task::spawn(async move {
+            if let Err(e) = clean_empty_dirs(&CONFIG.common.data_wal_dir).await {
+                log::error!("clean_empty_dirs, err: {}", e);
+            }
+        });
     }
 
     tokio::task::spawn(async move { files::run().await });

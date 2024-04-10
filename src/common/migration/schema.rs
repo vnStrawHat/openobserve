@@ -1,4 +1,4 @@
-// Copyright 2023 Zinc Labs Inc.
+// Copyright 2024 Zinc Labs Inc.
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -13,7 +13,6 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use anyhow::Ok;
 use chrono::Utc;
 use config::utils::json;
 use datafusion::arrow::datatypes::Schema;
@@ -39,24 +38,62 @@ pub async fn run() -> Result<(), anyhow::Error> {
         }
     };
 
+    // get lock
     let locker = infra::dist_lock::lock(SCHEMA_MIGRATION_KEY, 0).await?;
+
+    // after get lock, need check again
+    match upgrade_schema_row_per_version().await {
+        std::result::Result::Ok(true) => {
+            log::info!("[Schema:Migration]: Starting schema migration");
+        }
+        std::result::Result::Ok(false) => {
+            log::info!("[Schema:Migration]: Schema migration already done");
+            infra::dist_lock::unlock(&locker).await?;
+            return Ok(());
+        }
+        Err(err) => {
+            log::error!(
+                "[Schema:Migration]: Error checking schema migration status: {}",
+                err
+            );
+            infra::dist_lock::unlock(&locker).await?;
+            return Err(err);
+        }
+    };
+
     let default_end_dt = "0".to_string();
     let cc = infra_db::get_coordinator().await;
-    cc.add_start_dt_column().await?;
+    if let Err(e) = cc.add_start_dt_column().await {
+        infra::dist_lock::unlock(&locker).await?;
+        return Err(e.into());
+    }
 
     let db = infra_db::get_db().await;
-    db.add_start_dt_column().await?;
+    if let Err(e) = db.add_start_dt_column().await {
+        infra::dist_lock::unlock(&locker).await?;
+        return Err(e.into());
+    }
 
     log::info!("[Schema:Migration]: Inside migrating schemas");
     let db_key = "/schema/".to_string();
     log::info!("[Schema:Migration]: Listing all schemas");
-    let data = db.list(&db_key).await?;
+    let data = match db.list(&db_key).await {
+        Ok(v) => v,
+        Err(e) => {
+            infra::dist_lock::unlock(&locker).await?;
+            return Err(e.into());
+        }
+    };
     for (key, val) in data {
         println!("[Schema:Migration]: Start migrating schema: {}", key);
         let schemas: Vec<Schema> = json::from_slice(&val).unwrap();
+        let versions_count = schemas.len();
         let mut prev_end_dt: i64 = 0;
 
         for schema in schemas {
+            if schema.fields().is_empty() && versions_count > 1 {
+                continue; // Skip empty schema when there are multiple versions
+            }
             let meta = schema.metadata();
             let start_dt: i64 = match meta.get("start_dt") {
                 Some(val) => val.clone().parse().unwrap(),
@@ -74,22 +111,31 @@ pub async fn run() -> Result<(), anyhow::Error> {
                 .clone()
                 .parse()
                 .unwrap();
-            db.put(
-                &key,
-                json::to_vec(&vec![schema]).unwrap().into(),
-                NO_NEED_WATCH,
-                Some(start_dt),
-            )
-            .await?;
+            if let Err(e) = db
+                .put(
+                    &key,
+                    json::to_vec(&vec![schema]).unwrap().into(),
+                    NO_NEED_WATCH,
+                    Some(start_dt),
+                )
+                .await
+            {
+                infra::dist_lock::unlock(&locker).await?;
+                return Err(e.into());
+            }
         }
         println!(
             "[Schema:Migration]: Done creating row per version of schema: {}",
             key
         );
-        db.delete(&key, false, infra_db::NEED_WATCH, Some(0))
-            .await?;
+        if let Err(e) = db.delete(&key, false, infra_db::NEED_WATCH, Some(0)).await {
+            infra::dist_lock::unlock(&locker).await?;
+            return Err(e.into());
+        }
         println!("[Schema:Migration]: Done migrating schema: {}", key);
     }
+
+    // unlock the lock
     infra::dist_lock::unlock(&locker).await?;
 
     db.put(

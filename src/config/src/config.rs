@@ -1,4 +1,4 @@
-// Copyright 2023 Zinc Labs Inc.
+// Copyright 2024 Zinc Labs Inc.
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -300,8 +300,6 @@ pub struct Config {
     pub log: Log,
     pub etcd: Etcd,
     pub nats: Nats,
-    pub sled: Sled,
-    pub dynamo: Dynamo,
     pub s3: S3,
     pub tcp: TCP,
     pub prom: Prometheus,
@@ -353,13 +351,15 @@ pub struct Smtp {
 
 #[derive(EnvConfig)]
 pub struct Pyroscope {
+    #[env_config(name = "ZO_PROF_PYROSCOPE_ENABLED", default = false)]
+    pub enabled: bool,
     #[env_config(
         name = "ZO_PROF_PYROSCOPE_SERVER_URL",
         default = "http://localhost:4040"
     )]
-    pub pyroscope_server_url: String,
+    pub server_url: String,
     #[env_config(name = "ZO_PROF_PYROSCOPE_PROJECT_NAME", default = "openobserve")]
-    pub pyroscope_project_name: String,
+    pub project_name: String,
 }
 
 #[derive(EnvConfig)]
@@ -368,6 +368,12 @@ pub struct Auth {
     pub root_user_email: String,
     #[env_config(name = "ZO_ROOT_USER_PASSWORD")]
     pub root_user_password: String,
+    #[env_config(name = "ZO_COOKIE_MAX_AGE", default = 2592000)] // seconds, 30 days
+    pub cookie_max_age: i64,
+    #[env_config(name = "ZO_COOKIE_SAME_SITE_LAX", default = true)]
+    pub cookie_same_site_lax: bool,
+    #[env_config(name = "ZO_COOKIE_SECURE_ONLY", default = false)]
+    pub cookie_secure_only: bool,
 }
 
 #[derive(EnvConfig)]
@@ -412,6 +418,8 @@ pub struct TCP {
 pub struct Route {
     #[env_config(name = "ZO_ROUTE_TIMEOUT", default = 600)]
     pub timeout: u64,
+    #[env_config(name = "ZO_ROUTE_MAX_CONNECTIONS", default = 1024)]
+    pub max_connections: usize,
     // zo1-openobserve-ingester.ziox-dev.svc.cluster.local
     #[env_config(name = "ZO_INGESTER_SERVICE_URL", default = "")]
     pub ingester_srv_url: String,
@@ -507,7 +515,7 @@ pub struct Common {
     pub tracing_header_key: String,
     #[env_config(
         name = "ZO_TRACING_HEADER_VALUE",
-        default = "Basic YWRtaW46Q29tcGxleHBhc3MjMTIz"
+        default = "Basic cm9vdEBleGFtcGxlLmNvbTpDb21wbGV4cGFzcyMxMjM="
     )]
     pub tracing_header_value: String,
     #[env_config(name = "ZO_TELEMETRY", default = true)]
@@ -530,6 +538,19 @@ pub struct Common {
     pub usage_report_compressed_size: bool,
     #[env_config(name = "ZO_USAGE_ORG", default = "_meta")]
     pub usage_org: String,
+    #[env_config(
+        name = "ZO_USAGE_REPORTING_MODE",
+        default = "local",
+        help = "possible values - 'local', 'remote', 'both'"
+    )] // local, remote , both
+    pub usage_reporting_mode: String,
+    #[env_config(
+        name = "ZO_USAGE_REPORTING_URL",
+        default = "http://localhost:5080/api/_meta/usage/_json"
+    )]
+    pub usage_reporting_url: String,
+    #[env_config(name = "ZO_USAGE_REPORTING_CREDS", default = "")]
+    pub usage_reporting_creds: String,
     #[env_config(name = "ZO_USAGE_BATCH_SIZE", default = 2000)]
     pub usage_batch_size: usize,
     #[env_config(name = "ZO_MMDB_DATA_DIR")] // ./data/openobserve/mmdb/
@@ -577,14 +598,12 @@ pub struct Common {
         help = "Toggle inverted index generation."
     )]
     pub inverted_index_enabled: bool,
-
     #[env_config(
         name = "ZO_INVERTED_INDEX_SPLIT_CHARS",
         default = " ;,",
         help = "Characters which should be used as a delimiter to split the string."
     )]
     pub inverted_index_split_chars: String,
-
     #[env_config(
         name = "ZO_QUERY_ON_STREAM_SELECTION",
         default = true,
@@ -597,13 +616,6 @@ pub struct Common {
         help = "Show docs count and stream dates"
     )]
     pub show_stream_dates_doc_num: bool,
-
-    #[env_config(
-        name = "ZO_RUN_SCHEMA_MIGRATION_ON_START_UP",
-        default = false,
-        help = "Run autimatic schema migration on start up"
-    )]
-    pub run_schema_migration_on_start_up: bool,
     #[env_config(name = "ZO_INGEST_BLOCKED_STREAMS", default = "")] // use comma to split
     pub blocked_streams: String,
     #[env_config(name = "ZO_INGEST_INFER_SCHEMA_PER_REQUEST", default = false)]
@@ -642,6 +654,8 @@ pub struct Limit {
     pub mem_persist_interval: u64,
     #[env_config(name = "ZO_FILE_PUSH_INTERVAL", default = 10)] // seconds
     pub file_push_interval: u64,
+    #[env_config(name = "ZO_FILE_PUSH_LIMIT", default = 0)] // files
+    pub file_push_limit: usize,
     #[env_config(name = "ZO_FILE_MOVE_THREAD_NUM", default = 0)]
     pub file_move_thread_num: usize,
     #[env_config(name = "ZO_QUERY_THREAD_NUM", default = 0)]
@@ -682,7 +696,7 @@ pub struct Limit {
     pub enrichment_table_limit: usize,
     #[env_config(name = "ZO_ACTIX_REQ_TIMEOUT", default = 30)] // seconds
     pub request_timeout: u64,
-    #[env_config(name = "ZO_ACTIX_KEEP_ALIVE", default = 5)] // seconds
+    #[env_config(name = "ZO_ACTIX_KEEP_ALIVE", default = 30)] // seconds
     pub keep_alive: u64,
     #[env_config(name = "ZO_ACTIX_SHUTDOWN_TIMEOUT", default = 10)] // seconds
     pub shutdown_timeout: u64,
@@ -704,7 +718,7 @@ pub struct Limit {
     pub starting_expect_querier_num: usize,
     #[env_config(name = "ZO_QUERY_OPTIMIZATION_NUM_FIELDS", default = 0)]
     pub query_optimization_num_fields: usize,
-    #[env_config(name = "ZO_QUICK_MODE_NUM_FIELDS", default = 100)]
+    #[env_config(name = "ZO_QUICK_MODE_NUM_FIELDS", default = 200)]
     pub quick_mode_num_fields: usize,
     #[env_config(name = "ZO_QUICK_MODE_STRATEGY", default = "")]
     pub quick_mode_strategy: String, // first, last, both
@@ -716,6 +730,22 @@ pub struct Limit {
     pub sql_min_db_connections: u32,
     #[env_config(name = "ZO_META_CONNECTION_POOL_MAX_SIZE", default = 0)] // number of connections
     pub sql_max_db_connections: u32,
+    #[env_config(
+        name = "ZO_META_TRANSACTION_RETRIES",
+        help = "max time of transaction will retry",
+        default = 10
+    )]
+    pub meta_transaction_retries: usize,
+    #[env_config(
+        name = "ZO_META_TRANSACTION_LOCK_TIMEOUT",
+        help = "timeout of transaction lock",
+        default = 600
+    )] // seconds
+    pub meta_transaction_lock_timeout: usize,
+    #[env_config(name = "ZO_DISTINCT_VALUES_INTERVAL", default = 10)] // seconds
+    pub distinct_values_interval: u64,
+    #[env_config(name = "ZO_DISTINCT_VALUES_HOURLY", default = false)]
+    pub distinct_values_hourly: bool,
 }
 
 #[derive(EnvConfig)]
@@ -724,6 +754,8 @@ pub struct Compact {
     pub enabled: bool,
     #[env_config(name = "ZO_COMPACT_INTERVAL", default = 60)] // seconds
     pub interval: u64,
+    #[env_config(name = "ZO_COMPACT_LOOKBACK_HOURS", default = 0)] // hours
+    pub lookback_hours: i64,
     #[env_config(name = "ZO_COMPACT_STEP_SECS", default = 3600)] // seconds
     pub step_secs: i64,
     #[env_config(name = "ZO_COMPACT_SYNC_TO_DB_INTERVAL", default = 1800)] // seconds
@@ -757,6 +789,10 @@ pub struct MemoryCache {
     // MB, when cache is full will release how many data once time, default is 1% of max_size
     #[env_config(name = "ZO_MEMORY_CACHE_RELEASE_SIZE", default = 0)]
     pub release_size: usize,
+    #[env_config(name = "ZO_MEMORY_CACHE_GC_SIZE", default = 10)] // MB
+    pub gc_size: usize,
+    #[env_config(name = "ZO_MEMORY_CACHE_GC_INTERVAL", default = 0)] // seconds
+    pub gc_interval: u64,
     // MB, default is 50% of system memory
     #[env_config(name = "ZO_MEMORY_CACHE_DATAFUSION_MAX_SIZE", default = 0)]
     pub datafusion_max_size: usize,
@@ -781,6 +817,10 @@ pub struct DiskCache {
     // MB, when cache is full will release how many data once time, default is 1% of max_size
     #[env_config(name = "ZO_DISK_CACHE_RELEASE_SIZE", default = 0)]
     pub release_size: usize,
+    #[env_config(name = "ZO_DISK_CACHE_GC_SIZE", default = 10)] // MB
+    pub gc_size: usize,
+    #[env_config(name = "ZO_DISK_CACHE_GC_INTERVAL", default = 0)] // seconds
+    pub gc_interval: u64,
 }
 
 #[derive(EnvConfig)]
@@ -811,14 +851,6 @@ pub struct Log {
     pub events_url: String,
     #[env_config(name = "ZO_EVENTS_BATCH_SIZE", default = 10)]
     pub events_batch_size: usize,
-}
-
-#[derive(EnvConfig)]
-pub struct Sled {
-    #[env_config(name = "ZO_SLED_DATA_DIR", default = "")] // ./data/openobserve/db/
-    pub data_dir: String,
-    #[env_config(name = "ZO_SLED_PREFIX", default = "/zinc/observe/")]
-    pub prefix: String,
 }
 
 #[derive(Debug, EnvConfig)]
@@ -861,25 +893,14 @@ pub struct Nats {
     pub user: String,
     #[env_config(name = "ZO_NATS_PASSWORD", default = "")]
     pub password: String,
+    #[env_config(name = "ZO_NATS_REPLICAS", default = 3)]
+    pub replicas: usize,
     #[env_config(name = "ZO_NATS_CONNECT_TIMEOUT", default = 5)]
     pub connect_timeout: u64,
     #[env_config(name = "ZO_NATS_COMMAND_TIMEOUT", default = 10)]
     pub command_timeout: u64,
     #[env_config(name = "ZO_NATS_LOCK_WAIT_TIMEOUT", default = 3600)]
     pub lock_wait_timeout: u64,
-}
-
-#[derive(EnvConfig)]
-pub struct Dynamo {
-    #[env_config(name = "ZO_META_DYNAMO_PREFIX", default = "")] // default set to s3 bucket name
-    pub prefix: String,
-    pub file_list_table: String,
-    pub file_list_deleted_table: String,
-    pub stream_stats_table: String,
-    pub org_meta_table: String,
-    pub meta_table: String,
-    pub schema_table: String,
-    pub compact_table: String,
 }
 
 #[derive(Debug, EnvConfig)]
@@ -970,6 +991,12 @@ pub fn init() -> Config {
     if cfg.limit.file_move_thread_num == 0 {
         cfg.limit.file_move_thread_num = cpu_num * 2;
     }
+    if cfg.limit.file_push_interval == 0 {
+        cfg.limit.file_push_interval = 10;
+    }
+    if cfg.limit.file_push_limit == 0 {
+        cfg.limit.file_push_limit = 10000;
+    }
 
     if cfg.limit.sql_min_db_connections == 0 {
         cfg.limit.sql_min_db_connections = cpu_num as u32
@@ -1004,19 +1031,9 @@ pub fn init() -> Config {
         panic!("etcd config error: {e}");
     }
 
-    // check sled config
-    if let Err(e) = check_sled_config(&mut cfg) {
-        panic!("sled config error: {e}");
-    }
-
     // check s3 config
     if let Err(e) = check_s3_config(&mut cfg) {
         panic!("s3 config error: {e}");
-    }
-
-    // check dynamo config
-    if let Err(e) = check_dynamo_config(&mut cfg) {
-        panic!("dynamo config error: {e}");
     }
 
     cfg
@@ -1167,12 +1184,6 @@ fn check_path_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
     if !cfg.common.data_cache_dir.ends_with('/') {
         cfg.common.data_cache_dir = format!("{}/", cfg.common.data_cache_dir);
     }
-    if cfg.sled.data_dir.is_empty() {
-        cfg.sled.data_dir = format!("{}db/", cfg.common.data_dir);
-    }
-    if !cfg.sled.data_dir.ends_with('/') {
-        cfg.sled.data_dir = format!("{}/", cfg.sled.data_dir);
-    }
     if cfg.common.mmdb_data_dir.is_empty() {
         cfg.common.mmdb_data_dir = format!("{}mmdb/", cfg.common.data_dir);
     }
@@ -1215,20 +1226,6 @@ fn check_etcd_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-fn check_sled_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
-    if cfg.sled.data_dir.is_empty() {
-        cfg.sled.data_dir = format!("{}db/", cfg.common.data_dir);
-    }
-    if !cfg.sled.data_dir.ends_with('/') {
-        cfg.sled.data_dir = format!("{}/", cfg.sled.data_dir);
-    }
-    if !cfg.sled.prefix.is_empty() && !cfg.sled.prefix.ends_with('/') {
-        cfg.sled.prefix = format!("{}/", cfg.sled.prefix);
-    }
-
-    Ok(())
-}
-
 fn check_memory_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
     let mem_total = cgroup::get_memory_limit();
     cfg.limit.mem_total = mem_total;
@@ -1250,6 +1247,11 @@ fn check_memory_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
         cfg.memory_cache.release_size = cfg.memory_cache.max_size / 100;
     } else {
         cfg.memory_cache.release_size *= 1024 * 1024;
+    }
+    if cfg.memory_cache.gc_size == 0 {
+        cfg.memory_cache.gc_size = 10 * 1024 * 1024; // 10 MB
+    } else {
+        cfg.memory_cache.gc_size *= 1024 * 1024;
     }
     if cfg.memory_cache.datafusion_max_size == 0 {
         cfg.memory_cache.datafusion_max_size = mem_total - cfg.memory_cache.max_size;
@@ -1329,6 +1331,11 @@ fn check_disk_cache_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
     } else {
         cfg.disk_cache.release_size *= 1024 * 1024;
     }
+    if cfg.disk_cache.gc_size == 0 {
+        cfg.disk_cache.gc_size = 10 * 1024 * 1024; // 10 MB
+    } else {
+        cfg.disk_cache.gc_size *= 1024 * 1024;
+    }
     Ok(())
 }
 
@@ -1363,28 +1370,18 @@ fn check_s3_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-fn check_dynamo_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
-    if cfg.common.meta_store.starts_with("dynamo") && cfg.dynamo.prefix.is_empty() {
-        cfg.dynamo.prefix = if cfg.s3.bucket_name.is_empty() {
-            "default".to_string()
-        } else {
-            cfg.s3.bucket_name.clone()
-        };
-    }
-    cfg.dynamo.file_list_table = format!("{}-file-list", cfg.dynamo.prefix);
-    cfg.dynamo.file_list_deleted_table = format!("{}-file-list-deleted", cfg.dynamo.prefix);
-    cfg.dynamo.stream_stats_table = format!("{}-stream-stats", cfg.dynamo.prefix);
-    cfg.dynamo.org_meta_table = format!("{}-org-meta", cfg.dynamo.prefix);
-    cfg.dynamo.meta_table = format!("{}-meta", cfg.dynamo.prefix);
-    cfg.dynamo.schema_table = format!("{}-schema", cfg.dynamo.prefix);
-    cfg.dynamo.compact_table = format!("{}-compact", cfg.dynamo.prefix);
-
-    Ok(())
-}
-
 #[inline]
 pub fn is_local_disk_storage() -> bool {
     CONFIG.common.local_mode && CONFIG.common.local_mode_storage.eq("disk")
+}
+
+#[inline]
+pub fn get_cluster_name() -> String {
+    if !CONFIG.common.cluster_name.is_empty() {
+        CONFIG.common.cluster_name.to_string()
+    } else {
+        INSTANCE_ID.get("instance_id").unwrap().to_string()
+    }
 }
 
 #[cfg(test)]
@@ -1433,7 +1430,6 @@ mod tests {
         cfg.common.data_dir = "/abc".to_string();
         cfg.common.data_wal_dir = "/abc".to_string();
         cfg.common.data_stream_dir = "/abc".to_string();
-        cfg.sled.data_dir = "/abc/".to_string();
         cfg.common.base_uri = "/abc/".to_string();
         let ret = check_path_config(&mut cfg);
         assert!(ret.is_ok());

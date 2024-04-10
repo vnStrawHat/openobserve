@@ -1,4 +1,4 @@
-// Copyright 2023 Zinc Labs Inc.
+// Copyright 2024 Zinc Labs Inc.
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -35,7 +35,6 @@ const ITEM_PREFIXES: [&str; 13] = [
 pub async fn run(from: &str, to: &str) -> Result<(), anyhow::Error> {
     println!("load meta from {}", from);
     let src: Box<dyn infra_db::Db> = match from.to_lowercase().as_str().trim() {
-        "sled" => Box::<infra_db::sled::SledDb>::default(),
         "sqlite" => Box::<infra_db::sqlite::SqliteDb>::default(),
         "etcd" => Box::<infra_db::etcd::Etcd>::default(),
         "mysql" => Box::<infra_db::mysql::MysqlDb>::default(),

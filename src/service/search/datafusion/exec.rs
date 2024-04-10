@@ -1,4 +1,4 @@
-// Copyright 2023 Zinc Labs Inc.
+// Copyright 2024 Zinc Labs Inc.
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -17,8 +17,11 @@ use std::{str::FromStr, sync::Arc};
 
 use arrow_schema::Field;
 use config::{
-    ider,
-    meta::stream::{FileKey, FileMeta, StreamType},
+    meta::{
+        search::{SearchType, Session as SearchSession, StorageType},
+        sql,
+        stream::{FileKey, FileMeta, StreamType},
+    },
     utils::{flatten, json, parquet::new_parquet_writer, schema::infer_json_schema_from_values},
     CONFIG, PARQUET_BATCH_SIZE,
 };
@@ -46,21 +49,14 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use hashbrown::HashMap;
-use infra::cache::tmpfs;
+use infra::cache::tmpfs::Directory;
 use once_cell::sync::Lazy;
 use parquet::arrow::ArrowWriter;
 use regex::Regex;
 
-use super::{
-    storage::{file_list, StorageType},
-    transform_udf::get_all_transform,
-};
+use super::{storage::file_list, transform_udf::get_all_transform};
 use crate::{
-    common::meta::{
-        functions::VRLResultResolver,
-        search::{SearchType, Session as SearchSession},
-        sql,
-    },
+    common::meta::functions::VRLResultResolver,
     service::search::{datafusion::rewrite, sql::Sql},
 };
 
@@ -95,7 +91,7 @@ pub async fn sql(
     }
 
     let start = std::time::Instant::now();
-    let session_id = session.id.clone();
+    let trace_id = session.id.clone();
     let select_wildcard = sql.origin_sql.to_lowercase().starts_with("select * ");
     let without_optimizer = select_wildcard
         && CONFIG.limit.query_optimization_num_fields > 0
@@ -186,10 +182,7 @@ pub async fn sql(
     for (name, orig_agg_sql) in sql.aggs.iter() {
         // Debug SQL
         if CONFIG.common.print_key_sql {
-            log::info!(
-                "[session_id {session_id}] Query agg sql: {}",
-                orig_agg_sql.0
-            );
+            log::info!("[trace_id {trace_id}] Query agg sql: {}", orig_agg_sql.0);
         }
 
         let mut agg_sql = orig_agg_sql.0.to_owned();
@@ -238,7 +231,7 @@ pub async fn sql(
 
         let q_time = start.elapsed().as_secs_f64();
         log::info!(
-            "[session_id {session_id}] Query agg:{name} took {:.3} seconds.",
+            "[trace_id {trace_id}] Query agg:{name} took {:.3} seconds.",
             q_time - spend_time
         );
         spend_time = q_time;
@@ -248,7 +241,7 @@ pub async fn sql(
     ctx.deregister_table("tbl")?;
     ctx_aggs.deregister_table("tbl")?;
     log::info!(
-        "[session_id {session_id}] Query all took {:.3} seconds.",
+        "[trace_id {trace_id}] Query all took {:.3} seconds.",
         start.elapsed().as_secs_f64()
     );
 
@@ -265,7 +258,7 @@ async fn exec_query(
     file_type: FileType,
 ) -> Result<Vec<RecordBatch>> {
     let start = std::time::Instant::now();
-    let session_id = session.id.clone();
+    let trace_id = session.id.clone();
 
     let select_wildcard = sql.origin_sql.to_lowercase().starts_with("select * ");
     let without_optimizer = select_wildcard
@@ -334,14 +327,14 @@ async fn exec_query(
 
     // Debug SQL
     if CONFIG.common.print_key_sql {
-        log::info!("[session_id {session_id}] Query sql: {}", query);
+        log::info!("[trace_id {trace_id}] Query sql: {}", query);
     }
 
     let mut df = match q_ctx.sql(&query).await {
         Ok(df) => df,
         Err(e) => {
             log::error!(
-                "[session_id {session_id}] query sql execute failed, session: {:?}, sql: {}, err: {:?}",
+                "[trace_id {trace_id}] query sql execute failed, session: {:?}, sql: {}, err: {:?}",
                 session,
                 sql.origin_sql,
                 e
@@ -375,7 +368,7 @@ async fn exec_query(
     if field_fns.is_empty() && sql.query_fn.is_none() {
         let batches = df.clone().collect().await?;
         log::info!(
-            "[session_id {session_id}] Query took {:.3} seconds.",
+            "[trace_id {trace_id}] Query took {:.3} seconds.",
             start.elapsed().as_secs_f64()
         );
         return Ok(batches);
@@ -477,7 +470,7 @@ async fn exec_query(
     };
     let batches = df.clone().collect().await?;
     log::info!(
-        "[session_id {session_id}] Query took {:.3} seconds.",
+        "[trace_id {trace_id}] Query took {:.3} seconds.",
         start.elapsed().as_secs_f64()
     );
     Ok(batches)
@@ -562,8 +555,9 @@ pub async fn merge(
         return Ok(vec![]);
     }
 
+    let work_dir = Directory::default();
     // write temp file
-    let (mut schema, work_dir) = merge_write_recordbatch(batches)?;
+    let mut schema = merge_write_recordbatch(batches, &work_dir)?;
     if schema.fields().is_empty() {
         return Ok(vec![]);
     }
@@ -624,7 +618,7 @@ pub async fn merge(
     let listing_options = ListingOptions::new(Arc::new(file_format))
         .with_file_extension(FileType::PARQUET.get_ext())
         .with_target_partitions(CONFIG.limit.cpu_num);
-    let list_url = format!("tmpfs://{work_dir}");
+    let list_url = format!("tmpfs:///{}/", work_dir.name());
     let prefix = match ListingTableUrl::parse(list_url) {
         Ok(url) => url,
         Err(e) => {
@@ -668,15 +662,14 @@ pub async fn merge(
     }
     ctx.deregister_table("tbl")?;
 
-    // clear temp file
-    tmpfs::delete(&work_dir, true).unwrap();
+    // drop temp dir
+    drop(work_dir);
 
     Ok(batches)
 }
 
-fn merge_write_recordbatch(batches: &[RecordBatch]) -> Result<(Arc<Schema>, String)> {
+fn merge_write_recordbatch(batches: &[RecordBatch], work_dir: &Directory) -> Result<Arc<Schema>> {
     let mut i = 0;
-    let work_dir = format!("/tmp/merge/{}/", ider::uuid());
     let mut schema = Schema::empty();
     for row in batches.iter() {
         if row.num_rows() == 0 {
@@ -685,15 +678,17 @@ fn merge_write_recordbatch(batches: &[RecordBatch]) -> Result<(Arc<Schema>, Stri
         i += 1;
         let row_schema = row.schema();
         schema = Schema::try_merge(vec![schema, row_schema.as_ref().clone()])?;
-        let file_name = format!("{work_dir}{i}.parquet");
+        let file_name = format!("{}{i}.parquet", work_dir.name());
         let mut buf_parquet = Vec::new();
         let mut writer = ArrowWriter::try_new(&mut buf_parquet, row_schema, None)?;
         writer.write(row)?;
         writer.close()?;
-        tmpfs::set(&file_name, buf_parquet.into()).expect("tmpfs set success");
+        work_dir
+            .set(&file_name, buf_parquet.into())
+            .expect("tmpfs set success");
     }
     filter_schema_null_fields(&mut schema); // fix schema
-    Ok((Arc::new(schema), work_dir))
+    Ok(Arc::new(schema))
 }
 
 fn merge_rewrite_sql(sql: &str, schema: Arc<Schema>, is_final_phase: bool) -> Result<String> {
@@ -713,44 +708,41 @@ fn merge_rewrite_sql(sql: &str, schema: Arc<Schema>, is_final_phase: bool) -> Re
 
     let mut fields = Vec::new();
     let mut from_pos = 0;
-    let sql_chars = sql.chars().collect::<Vec<char>>();
-    let sql_chars_len = sql_chars.len();
     let mut start_pos = 0;
     let mut in_word = false;
     let mut brackets = 0;
     let mut quotes = 0;
     let mut quote_now = '\"';
-    for i in 0..sql_chars_len {
-        let c = sql_chars.get(i).unwrap();
-        if *c == '(' {
+    for (i, c) in sql.char_indices() {
+        if c == '(' {
             brackets += 1;
             continue;
         }
-        if *c == ')' {
+        if c == ')' {
             brackets -= 1;
             continue;
         }
-        if *c == '"' || *c == '\'' {
+        if c == '"' || c == '\'' {
             if quotes == 0 {
                 quotes += 1;
-                quote_now = *c;
+                quote_now = c;
                 if !in_word {
                     start_pos = i;
                     in_word = true;
                 }
                 continue;
             }
-            if quotes == 1 && quote_now == *c {
+            if quotes == 1 && quote_now == c {
                 quotes = 0;
                 continue;
             }
         }
-        if *c == ',' || *c == ' ' {
+        if c == ',' || c == ' ' {
             if brackets > 0 || quotes > 0 {
                 continue;
             }
             if in_word {
-                let field = sql_chars[start_pos..i].iter().collect::<String>();
+                let field = sql[start_pos..i].to_string();
                 if field.to_lowercase().eq("from") {
                     from_pos = i;
                     break;
@@ -932,7 +924,7 @@ fn merge_rewrite_sql(sql: &str, schema: Arc<Schema>, is_final_phase: bool) -> Re
 }
 
 pub async fn convert_parquet_file(
-    session_id: &str,
+    trace_id: &str,
     buf: &mut Vec<u8>,
     schema: Arc<Schema>,
     bloom_filter_fields: &[String],
@@ -976,7 +968,7 @@ pub async fn convert_parquet_file(
         }
     };
 
-    let prefix = match ListingTableUrl::parse(format!("tmpfs:///{session_id}/")) {
+    let prefix = match ListingTableUrl::parse(format!("tmpfs:///{trace_id}/")) {
         Ok(url) => url,
         Err(e) => {
             return Err(datafusion::error::DataFusionError::Execution(format!(
@@ -1053,13 +1045,14 @@ pub async fn convert_parquet_file(
 
 #[allow(clippy::too_many_arguments)]
 pub async fn merge_parquet_files(
-    session_id: &str,
+    trace_id: &str,
+    stream_type: StreamType,
+    stream_name: &str,
     buf: &mut Vec<u8>,
     schema: Arc<Schema>,
     bloom_filter_fields: &[String],
     full_text_search_fields: &[String],
     original_size: i64,
-    stream_type: StreamType,
     fts_buf: &mut Vec<RecordBatch>,
 ) -> Result<(FileMeta, Arc<Schema>)> {
     // query data
@@ -1072,7 +1065,7 @@ pub async fn merge_parquet_files(
     let listing_options = ListingOptions::new(Arc::new(file_format))
         .with_file_extension(FileType::PARQUET.get_ext())
         .with_target_partitions(CONFIG.limit.cpu_num);
-    let prefix = ListingTableUrl::parse(format!("tmpfs:///{session_id}/"))?;
+    let prefix = ListingTableUrl::parse(format!("tmpfs:///{trace_id}/"))?;
     let config = ListingTableConfig::new(prefix)
         .with_listing_options(listing_options)
         .with_schema(schema);
@@ -1118,8 +1111,19 @@ pub async fn merge_parquet_files(
 
     // get all sorted data
     let query_sql = if stream_type == StreamType::Index {
+        // TODO: NOT IN is not efficient, need to optimize it: NOT EXIST
         format!(
             "SELECT * FROM tbl WHERE file_name NOT IN (SELECT file_name FROM tbl WHERE deleted is True) ORDER BY {} DESC",
+            CONFIG.common.column_timestamp
+        )
+    } else if CONFIG.limit.distinct_values_hourly
+        && stream_type == StreamType::Metadata
+        && stream_name == "distinct_values"
+    {
+        format!(
+            "SELECT MIN({}) AS {}, SUM(count) as count, field_name, field_value, filter_name, filter_value, stream_name, stream_type FROM tbl GROUP BY field_name, field_value, filter_name, filter_value, stream_name, stream_type ORDER BY {} DESC",
+            CONFIG.common.column_timestamp,
+            CONFIG.common.column_timestamp,
             CONFIG.common.column_timestamp
         )
     } else {
@@ -1214,6 +1218,10 @@ pub fn create_runtime_env(_work_group: Option<String>) -> Result<RuntimeEnv> {
     let memory = super::storage::memory::FS::new();
     let memory_url = url::Url::parse("memory:///").unwrap();
     object_store_registry.register_store(&memory_url, Arc::new(memory));
+
+    let wal = super::storage::wal::FS::new();
+    let wal_url = url::Url::parse("wal:///").unwrap();
+    object_store_registry.register_store(&wal_url, Arc::new(wal));
 
     let tmpfs = super::storage::tmpfs::Tmpfs::new();
     let tmpfs_url = url::Url::parse("tmpfs:///").unwrap();
@@ -1329,6 +1337,9 @@ pub async fn register_table(
     let prefix = if session.storage_type.eq(&StorageType::Memory) {
         file_list::set(&session.id, files).await;
         format!("memory:///{}/", session.id)
+    } else if session.storage_type.eq(&StorageType::Wal) {
+        file_list::set(&session.id, files).await;
+        format!("wal:///{}/", session.id)
     } else if session.storage_type.eq(&StorageType::Tmpfs) {
         format!("tmpfs:///{}/", session.id)
     } else {
@@ -1490,9 +1501,10 @@ mod tests {
         )
         .unwrap();
 
-        let res = merge_write_recordbatch(&[batch1, batch2]).unwrap();
-        assert!(!res.0.fields().is_empty());
-        assert!(!res.1.is_empty())
+        let work_dir = Directory::default();
+        let schema = merge_write_recordbatch(&[batch1, batch2], &work_dir).unwrap();
+        assert!(!schema.fields().is_empty());
+        assert!(!work_dir.name().is_empty())
     }
 
     #[tokio::test]

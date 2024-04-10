@@ -1,4 +1,4 @@
-// Copyright 2023 Zinc Labs Inc.
+// Copyright 2024 Zinc Labs Inc.
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -31,6 +31,7 @@ use infra::{
 };
 use promql_parser::{label::MatchOp, parser};
 use prost::Message;
+use proto::prometheus_rpc;
 
 use crate::{
     common::{
@@ -39,7 +40,6 @@ use crate::{
             alerts,
             functions::StreamTransform,
             prom::*,
-            search,
             stream::{PartitioningDetails, SchemaRecords},
         },
     },
@@ -53,10 +53,6 @@ use crate::{
         usage::report_request_usage_stats,
     },
 };
-
-pub(crate) mod prometheus {
-    include!(concat!(env!("OUT_DIR"), "/prometheus.rs"));
-}
 
 pub async fn remote_write(
     org_id: &str,
@@ -99,7 +95,7 @@ pub async fn remote_write(
     let decoded = snap::raw::Decoder::new()
         .decompress_vec(&body)
         .map_err(|e| anyhow::anyhow!("Invalid snappy compressed data: {}", e.to_string()))?;
-    let request = prometheus::WriteRequest::decode(bytes::Bytes::from(decoded))
+    let request = prometheus_rpc::WriteRequest::decode(bytes::Bytes::from(decoded))
         .map_err(|e| anyhow::anyhow!("Invalid protobuf: {}", e.to_string()))?;
 
     // parse metadata
@@ -603,8 +599,8 @@ pub(crate) async fn get_series(
         }
     }
 
-    let req = search::Request {
-        query: search::Query {
+    let req = config::meta::search::Request {
+        query: config::meta::search::Query {
             sql,
             from: 0,
             size: 1000,
@@ -614,10 +610,10 @@ pub(crate) async fn get_series(
             ..Default::default()
         },
         aggs: HashMap::new(),
-        encoding: search::RequestEncoding::Empty,
+        encoding: config::meta::search::RequestEncoding::Empty,
         timeout: 0,
     };
-    let series = match search_service::search("", org_id, StreamType::Metrics, &req).await {
+    let series = match search_service::search("", org_id, StreamType::Metrics, None, &req).await {
         Err(err) => {
             log::error!("search series error: {err}");
             return Err(err);
@@ -745,8 +741,8 @@ pub(crate) async fn get_label_values(
     if schema.field_with_name(&label_name).is_err() {
         return Ok(vec![]);
     }
-    let req = search::Request {
-        query: search::Query {
+    let req = config::meta::search::Request {
+        query: config::meta::search::Query {
             sql: format!("SELECT DISTINCT({label_name}) FROM {metric_name}"),
             from: 0,
             size: 1000,
@@ -756,10 +752,10 @@ pub(crate) async fn get_label_values(
             ..Default::default()
         },
         aggs: HashMap::new(),
-        encoding: search::RequestEncoding::Empty,
+        encoding: config::meta::search::RequestEncoding::Empty,
         timeout: 0,
     };
-    let mut label_values = match search_service::search("", org_id, stream_type, &req).await {
+    let mut label_values = match search_service::search("", org_id, stream_type, None, &req).await {
         Ok(resp) => resp
             .hits
             .iter()

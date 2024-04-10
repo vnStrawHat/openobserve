@@ -1,4 +1,4 @@
-// Copyright 2023 Zinc Labs Inc.
+// Copyright 2024 Zinc Labs Inc.
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -16,15 +16,12 @@
 use std::{
     cmp::{max, min},
     ops::Range,
-    path::Path,
+    path::{Path, PathBuf},
 };
 
+use async_recursion::async_recursion;
 use bytes::Bytes;
-use config::{
-    is_local_disk_storage, metrics,
-    utils::{asynchronism::file::*, file::scan_files},
-    CONFIG,
-};
+use config::{is_local_disk_storage, metrics, utils::asynchronism::file::*, CONFIG};
 use once_cell::sync::Lazy;
 use tokio::{fs, sync::RwLock};
 
@@ -61,42 +58,10 @@ impl FileData {
             root_dir: format!(
                 "{}{}",
                 CONFIG.common.data_cache_dir,
-                storage::format_key("")
+                storage::format_key("", true)
             ),
             data: CacheStrategy::new(strategy),
         }
-    }
-
-    async fn load(&mut self) -> Result<(), anyhow::Error> {
-        log::info!("Loading disk cache start");
-        std::fs::create_dir_all(&self.root_dir).expect("create cache dir success");
-        let wal_dir = Path::new(&self.root_dir).canonicalize().unwrap();
-        let files = scan_files(&self.root_dir, "parquet");
-        for file in files {
-            let local_path = Path::new(&file).canonicalize().unwrap();
-            let file_key = local_path
-                .strip_prefix(&wal_dir)
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .replace('\\', "/");
-            let meta = get_file_meta(&file).await?;
-            let data_size = meta.len() as usize;
-            self.cur_size += data_size;
-            self.data.insert(file_key.clone(), data_size);
-            // metrics
-            let columns = file_key.split('/').collect::<Vec<&str>>();
-            if columns[0] == "files" {
-                metrics::QUERY_DISK_CACHE_FILES
-                    .with_label_values(&[columns[1], columns[2]])
-                    .dec();
-                metrics::QUERY_DISK_CACHE_USED_BYTES
-                    .with_label_values(&[columns[1], columns[2]])
-                    .sub(data_size as i64);
-            }
-        }
-        log::info!("Loading disk cache done");
-        Ok(())
     }
 
     async fn exist(&mut self, file: &str) -> bool {
@@ -118,18 +83,11 @@ impl FileData {
         })
     }
 
-    async fn set(
-        &mut self,
-        session_id: &str,
-        file: &str,
-        data: Bytes,
-    ) -> Result<(), anyhow::Error> {
+    async fn set(&mut self, trace_id: &str, file: &str, data: Bytes) -> Result<(), anyhow::Error> {
         let data_size = data.len();
         if self.cur_size + data_size >= self.max_size {
             log::info!(
-                "[session_id {session_id}] File disk cache is full {}/{}, can't cache extra {} bytes",
-                self.cur_size,
-                self.max_size,
+                "[trace_id {trace_id}] File disk cache is full, can't cache extra {} bytes",
                 data_size
             );
             // cache is full, need release some space
@@ -137,35 +95,7 @@ impl FileData {
                 CONFIG.disk_cache.max_size,
                 max(CONFIG.disk_cache.release_size, data_size * 100),
             );
-            let mut release_size = 0;
-            loop {
-                let item = self.data.remove();
-                if item.is_none() {
-                    log::error!(
-                        "[session_id {session_id}] File disk cache is corrupt, it shouldn't be none"
-                    );
-                    break;
-                }
-                let (key, data_size) = item.unwrap();
-                // delete file from local disk
-                let file_path = format!("{}{}", self.root_dir, key);
-                fs::remove_file(&file_path).await?;
-                // metrics
-                let columns = key.split('/').collect::<Vec<&str>>();
-                if columns[0] == "files" {
-                    metrics::QUERY_DISK_CACHE_FILES
-                        .with_label_values(&[columns[1], columns[2]])
-                        .dec();
-                    metrics::QUERY_DISK_CACHE_USED_BYTES
-                        .with_label_values(&[columns[1], columns[2]])
-                        .sub(data_size as i64);
-                }
-                release_size += data_size;
-                if release_size >= need_release_size {
-                    break;
-                }
-            }
-            self.cur_size -= release_size;
+            self.gc(trace_id, need_release_size).await?;
         }
 
         self.cur_size += data_size;
@@ -187,6 +117,49 @@ impl FileData {
         Ok(())
     }
 
+    async fn gc(&mut self, trace_id: &str, need_release_size: usize) -> Result<(), anyhow::Error> {
+        log::info!(
+            "[trace_id {trace_id}] File disk cache start gc {}/{}, need to release {} bytes",
+            self.cur_size,
+            self.max_size,
+            need_release_size
+        );
+        let mut release_size = 0;
+        loop {
+            let item = self.data.remove();
+            if item.is_none() {
+                log::error!(
+                    "[trace_id {trace_id}] File disk cache is corrupt, it shouldn't be none"
+                );
+                break;
+            }
+            let (key, data_size) = item.unwrap();
+            // delete file from local disk
+            let file_path = format!("{}{}", self.root_dir, key);
+            fs::remove_file(&file_path).await?;
+            // metrics
+            let columns = key.split('/').collect::<Vec<&str>>();
+            if columns[0] == "files" {
+                metrics::QUERY_DISK_CACHE_FILES
+                    .with_label_values(&[columns[1], columns[2]])
+                    .dec();
+                metrics::QUERY_DISK_CACHE_USED_BYTES
+                    .with_label_values(&[columns[1], columns[2]])
+                    .sub(data_size as i64);
+            }
+            release_size += data_size;
+            if release_size >= need_release_size {
+                break;
+            }
+        }
+        self.cur_size -= release_size;
+        log::info!(
+            "[trace_id {trace_id}] File disk cache gc done, released {} bytes",
+            release_size
+        );
+        Ok(())
+    }
+
     fn size(&self) -> (usize, usize) {
         (self.max_size, self.cur_size)
     }
@@ -201,9 +174,32 @@ impl FileData {
 }
 
 pub async fn init() -> Result<(), anyhow::Error> {
-    std::fs::create_dir_all(&CONFIG.common.data_cache_dir).expect("create cache dir success");
-    let mut files = FILES.write().await;
-    files.load().await?;
+    let root_dir = FILES.read().await.root_dir.clone();
+    let root_dir = Path::new(&root_dir).canonicalize().unwrap();
+    std::fs::create_dir_all(&root_dir).expect("create cache dir success");
+    tokio::task::spawn(async move {
+        log::info!("Loading disk cache start");
+        if let Err(e) = load(&root_dir, &root_dir).await {
+            log::error!("load disk cache error: {}", e);
+        }
+        log::info!("Loading disk cache done, total files: {} ", len().await);
+    });
+
+    tokio::task::spawn(async move {
+        if CONFIG.disk_cache.gc_interval == 0 {
+            return;
+        }
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(
+            config::CONFIG.disk_cache.gc_interval,
+        ));
+        interval.tick().await; // the first tick is immediate
+        loop {
+            if let Err(e) = gc().await {
+                log::error!("disk cache gc error: {}", e);
+            }
+            interval.tick().await;
+        }
+    });
     Ok(())
 }
 
@@ -226,7 +222,7 @@ pub async fn exist(file: &str) -> bool {
 }
 
 #[inline]
-pub async fn set(session_id: &str, file: &str, data: Bytes) -> Result<(), anyhow::Error> {
+pub async fn set(trace_id: &str, file: &str, data: Bytes) -> Result<(), anyhow::Error> {
     if !CONFIG.disk_cache.enabled || is_local_disk_storage() {
         return Ok(());
     }
@@ -234,7 +230,89 @@ pub async fn set(session_id: &str, file: &str, data: Bytes) -> Result<(), anyhow
     if files.exist(file).await {
         return Ok(());
     }
-    files.set(session_id, file, data).await
+    files.set(trace_id, file, data).await
+}
+
+#[async_recursion]
+async fn load(root_dir: &PathBuf, scan_dir: &PathBuf) -> Result<(), anyhow::Error> {
+    let mut entries = tokio::fs::read_dir(&scan_dir).await?;
+    loop {
+        match entries.next_entry().await {
+            Err(e) => return Err(e.into()),
+            Ok(None) => break,
+            Ok(Some(f)) => {
+                let fp = match f.path().canonicalize() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        log::error!("canonicalize file path error: {}", e);
+                        continue;
+                    }
+                };
+                let ft = match f.file_type().await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        log::error!("get file type error: {}", e);
+                        continue;
+                    }
+                };
+                if ft.is_dir() {
+                    if let Err(e) = load(root_dir, &fp).await {
+                        log::error!("load disk cache error: {}", e);
+                    }
+                } else {
+                    let meta = match get_file_meta(&fp).await {
+                        Ok(m) => m,
+                        Err(e) => {
+                            log::error!("get file meta error: {}", e);
+                            continue;
+                        }
+                    };
+                    let data_size = meta.len() as usize;
+                    let file_key = fp
+                        .strip_prefix(root_dir)
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .replace('\\', "/");
+                    // write into cache
+                    let mut w = FILES.write().await;
+                    w.cur_size += data_size;
+                    w.data.insert(file_key.clone(), data_size);
+                    let total = w.len();
+                    drop(w);
+                    // print progress
+                    if total % 1000 == 0 {
+                        log::info!("Loading disk cache {}", total);
+                    }
+                    // metrics
+                    let columns = file_key.split('/').collect::<Vec<&str>>();
+                    metrics::QUERY_DISK_CACHE_FILES
+                        .with_label_values(&[columns[1], columns[2]])
+                        .dec();
+                    metrics::QUERY_DISK_CACHE_USED_BYTES
+                        .with_label_values(&[columns[1], columns[2]])
+                        .sub(data_size as i64);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn gc() -> Result<(), anyhow::Error> {
+    if !CONFIG.disk_cache.enabled || is_local_disk_storage() {
+        return Ok(());
+    }
+    let files = FILES.read().await;
+    if files.cur_size + CONFIG.disk_cache.release_size < files.max_size {
+        drop(files);
+        return Ok(());
+    }
+    drop(files);
+    let mut files = FILES.write().await;
+    files.gc("global", CONFIG.disk_cache.gc_size).await?;
+    drop(files);
+    Ok(())
 }
 
 #[inline]
@@ -255,12 +333,12 @@ pub async fn is_empty() -> bool {
     files.is_empty()
 }
 
-pub async fn download(session_id: &str, file: &str) -> Result<(), anyhow::Error> {
+pub async fn download(trace_id: &str, file: &str) -> Result<(), anyhow::Error> {
     let data = storage::get(file).await?;
     if data.is_empty() {
         return Err(anyhow::anyhow!("file {} data size is zero", file));
     }
-    if let Err(e) = set(session_id, file, data).await {
+    if let Err(e) = set(trace_id, file, data).await {
         return Err(anyhow::anyhow!(
             "set file {} to disk cache failed: {}",
             file,
@@ -276,7 +354,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_lru_cache_set_file() {
-        let session_id = "session_123";
+        let trace_id = "session_123";
         let mut file_data = FileData::with_capacity_and_cache_strategy(1024, "lru");
         let content = Bytes::from("Some text Need to store in cache");
         for i in 0..100 {
@@ -284,27 +362,27 @@ mod tests {
                 "files/default/logs/olympics/2022/10/03/10/6982652937134804993_1_{}.parquet",
                 i
             );
-            let resp = file_data.set(session_id, &file_key, content.clone()).await;
+            let resp = file_data.set(trace_id, &file_key, content.clone()).await;
             assert!(resp.is_ok());
         }
     }
 
     #[tokio::test]
     async fn test_lru_cache_get_file() {
-        let session_id = "session_123";
+        let trace_id = "session_123";
         let mut file_data =
             FileData::with_capacity_and_cache_strategy(CONFIG.disk_cache.max_size, "lru");
         let file_key = "files/default/logs/olympics/2022/10/03/10/6982652937134804993_2_1.parquet";
         let content = Bytes::from("Some text");
 
         file_data
-            .set(session_id, file_key, content.clone())
+            .set(trace_id, file_key, content.clone())
             .await
             .unwrap();
         assert!(file_data.exist(file_key).await);
 
         file_data
-            .set(session_id, file_key, content.clone())
+            .set(trace_id, file_key, content.clone())
             .await
             .unwrap();
         assert!(file_data.exist(file_key).await);
@@ -313,20 +391,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_lru_cache_miss() {
-        let session_id = "session_456";
+        let trace_id = "session_456";
         let mut file_data = FileData::with_capacity_and_cache_strategy(10, "lru");
         let file_key1 = "files/default/logs/olympics/2022/10/03/10/6982652937134804993_3_1.parquet";
         let file_key2 = "files/default/logs/olympics/2022/10/03/10/6982652937134804993_3_2.parquet";
         let content = Bytes::from("Some text");
         // set one key
         file_data
-            .set(session_id, file_key1, content.clone())
+            .set(trace_id, file_key1, content.clone())
             .await
             .unwrap();
         assert!(file_data.exist(file_key1).await);
         // set another key, will release first key
         file_data
-            .set(session_id, file_key2, content.clone())
+            .set(trace_id, file_key2, content.clone())
             .await
             .unwrap();
         assert!(file_data.exist(file_key2).await);
@@ -336,7 +414,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fifo_cache_set_file() {
-        let session_id = "session_123";
+        let trace_id = "session_123";
         let mut file_data = FileData::with_capacity_and_cache_strategy(1024, "fifo");
         let content = Bytes::from("Some text Need to store in cache");
         for i in 0..100 {
@@ -344,27 +422,27 @@ mod tests {
                 "files/default/logs/olympics/2022/10/03/10/6982652937134804993_1_{}.parquet",
                 i
             );
-            let resp = file_data.set(session_id, &file_key, content.clone()).await;
+            let resp = file_data.set(trace_id, &file_key, content.clone()).await;
             assert!(resp.is_ok());
         }
     }
 
     #[tokio::test]
     async fn test_fifo_cache_get_file() {
-        let session_id = "session_123";
+        let trace_id = "session_123";
         let mut file_data =
             FileData::with_capacity_and_cache_strategy(CONFIG.disk_cache.max_size, "fifo");
         let file_key = "files/default/logs/olympics/2022/10/03/10/6982652937134804993_2_1.parquet";
         let content = Bytes::from("Some text");
 
         file_data
-            .set(session_id, file_key, content.clone())
+            .set(trace_id, file_key, content.clone())
             .await
             .unwrap();
         assert!(file_data.exist(file_key).await);
 
         file_data
-            .set(session_id, file_key, content.clone())
+            .set(trace_id, file_key, content.clone())
             .await
             .unwrap();
         assert!(file_data.exist(file_key).await);
@@ -373,20 +451,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_fifo_cache_miss() {
-        let session_id = "session_456";
+        let trace_id = "session_456";
         let mut file_data = FileData::with_capacity_and_cache_strategy(10, "fifo");
         let file_key1 = "files/default/logs/olympics/2022/10/03/10/6982652937134804993_3_1.parquet";
         let file_key2 = "files/default/logs/olympics/2022/10/03/10/6982652937134804993_3_2.parquet";
         let content = Bytes::from("Some text");
         // set one key
         file_data
-            .set(session_id, file_key1, content.clone())
+            .set(trace_id, file_key1, content.clone())
             .await
             .unwrap();
         assert!(file_data.exist(file_key1).await);
         // set another key, will release first key
         file_data
-            .set(session_id, file_key2, content.clone())
+            .set(trace_id, file_key2, content.clone())
             .await
             .unwrap();
         assert!(file_data.exist(file_key2).await);

@@ -1,4 +1,4 @@
-// Copyright 2023 Zinc Labs Inc.
+// Copyright 2024 Zinc Labs Inc.
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -17,7 +17,10 @@ use std::sync::Arc;
 
 use config::{
     is_local_disk_storage,
-    meta::stream::{FileKey, PartitionTimeLevel, StreamType},
+    meta::{
+        search::{ScanStats, SearchType, Session as SearchSession, StorageType},
+        stream::{FileKey, PartitionTimeLevel, StreamType},
+    },
     CONFIG,
 };
 use datafusion::{
@@ -31,23 +34,17 @@ use infra::cache::file_data;
 use tokio::sync::Semaphore;
 
 use crate::{
-    common::meta::{
-        search::{SearchType, Session as SearchSession},
-        stream::{ScanStats, StreamParams, StreamPartition},
-    },
+    common::meta::stream::{StreamParams, StreamPartition},
     service::{
         db, file_list,
-        search::{
-            datafusion::{exec::register_table, storage::StorageType},
-            match_source,
-        },
+        search::{datafusion::exec::register_table, match_source},
         stream,
     },
 };
 
 #[tracing::instrument(name = "promql:search:grpc:storage:create_context", skip_all, fields(org_id = org_id, stream_name = stream_name))]
 pub(crate) async fn create_context(
-    session_id: &str,
+    trace_id: &str,
     org_id: &str,
     stream_name: &str,
     time_range: (i64, i64),
@@ -94,7 +91,7 @@ pub(crate) async fn create_context(
 
     // get file list
     let mut files = get_file_list(
-        session_id,
+        trace_id,
         org_id,
         stream_name,
         partition_time_level,
@@ -146,7 +143,7 @@ pub(crate) async fn create_context(
     );
 
     let session = SearchSession {
-        id: session_id.to_string(),
+        id: trace_id.to_string(),
         storage_type: StorageType::Memory,
         search_type: SearchType::Normal,
         work_group: None,
@@ -167,10 +164,10 @@ pub(crate) async fn create_context(
 #[tracing::instrument(
     name = "promql:search:grpc:storage:get_file_list",
     skip_all,
-    fields(session_id, org_id, stream_name)
+    fields(trace_id, org_id, stream_name)
 )]
 async fn get_file_list(
-    session_id: &str,
+    trace_id: &str,
     org_id: &str,
     stream_name: &str,
     time_level: PartitionTimeLevel,
@@ -191,7 +188,7 @@ async fn get_file_list(
     {
         Ok(results) => results,
         Err(err) => {
-            log::error!("[session_id {session_id}] get file list error: {}", err);
+            log::error!("[trace_id {trace_id}] get file list error: {}", err);
             return Err(DataFusionError::Execution(
                 "get file list error".to_string(),
             ));
@@ -240,7 +237,7 @@ async fn cache_parquet_files(
     let mut tasks = Vec::new();
     let semaphore = std::sync::Arc::new(Semaphore::new(CONFIG.limit.query_thread_num));
     for file in files.iter() {
-        let session_id = "";
+        let trace_id = "";
         let file_name = file.key.clone();
         let permit = semaphore.clone().acquire_owned().await.unwrap();
         let task: tokio::task::JoinHandle<Option<String>> = tokio::task::spawn(async move {
@@ -249,7 +246,7 @@ async fn cache_parquet_files(
                     if !file_data::memory::exist(&file_name).await
                         && !file_data::disk::exist(&file_name).await
                     {
-                        file_data::memory::download(session_id, &file_name)
+                        file_data::memory::download(trace_id, &file_name)
                             .await
                             .err()
                     } else {
@@ -258,9 +255,7 @@ async fn cache_parquet_files(
                 }
                 file_data::CacheType::Disk => {
                     if !file_data::disk::exist(&file_name).await {
-                        file_data::disk::download(session_id, &file_name)
-                            .await
-                            .err()
+                        file_data::disk::download(trace_id, &file_name).await.err()
                     } else {
                         None
                     }

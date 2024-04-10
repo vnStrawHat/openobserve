@@ -1,4 +1,4 @@
-// Copyright 2023 Zinc Labs Inc.
+// Copyright 2024 Zinc Labs Inc.
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -18,6 +18,9 @@ use std::{
     io::{Read, Write},
     path::Path,
 };
+
+use async_walkdir::WalkDir;
+use futures::StreamExt;
 
 #[inline(always)]
 pub fn get_file_meta(file: &str) -> Result<Metadata, std::io::Error> {
@@ -40,46 +43,30 @@ pub fn put_file_contents(file: &str, contents: &[u8]) -> Result<(), std::io::Err
 }
 
 #[inline(always)]
-pub fn scan_files<P: AsRef<Path>>(root: P, ext: &str) -> Vec<String> {
-    walkdir::WalkDir::new(root)
-        .into_iter()
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
-            let path = entry.path();
-            if path.is_file() {
-                let path_ext = path.extension()?.to_str()?;
-                if path_ext == ext {
-                    Some(path.to_str().unwrap().to_string())
-                } else {
-                    None
-                }
+pub async fn scan_files<P: AsRef<Path>>(
+    root: P,
+    ext: &str,
+    limit: Option<usize>,
+) -> Result<Vec<String>, std::io::Error> {
+    let iter = WalkDir::new(root).filter_map(|entry| async move {
+        let entry = entry.ok()?;
+        let path = entry.path();
+        if path.is_file() {
+            let path_ext = path.extension()?.to_str()?;
+            if path_ext == ext {
+                Some(path.to_str()?.to_string())
             } else {
                 None
             }
-        })
-        .collect()
-}
-
-pub fn clean_empty_dirs(dir: &str) -> Result<(), std::io::Error> {
-    let mut dirs = Vec::new();
-    for entry in walkdir::WalkDir::new(dir) {
-        let entry = entry?;
-        if entry.path().display().to_string() == dir {
-            continue;
+        } else {
+            None
         }
-        if entry.file_type().is_dir() {
-            dirs.push(entry.path().to_str().unwrap().to_string());
-        }
-    }
-    dirs.sort_by_key(|b| std::cmp::Reverse(b.len()));
-    for dir in dirs {
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            if entries.count() == 0 {
-                std::fs::remove_dir(&dir)?;
-            }
-        }
-    }
-    Ok(())
+    });
+    Ok(if let Some(limit) = limit {
+        iter.take(limit).collect().await
+    } else {
+        iter.collect().await
+    })
 }
 
 #[cfg(unix)]
@@ -101,15 +88,15 @@ pub fn set_permission<P: AsRef<std::path::Path>>(
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_file() {
+    #[tokio::test]
+    async fn test_file() {
         let content = b"Some Text";
         let file_name = "sample.parquet";
 
         put_file_contents(file_name, content).unwrap();
         assert_eq!(get_file_contents(file_name).unwrap(), content);
         assert!(get_file_meta(file_name).unwrap().is_file());
-        assert!(!scan_files(".", "parquet").is_empty());
+        assert!(!scan_files(".", "parquet", None).await.unwrap().is_empty());
         std::fs::remove_file(file_name).unwrap();
     }
 }

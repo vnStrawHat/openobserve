@@ -1,4 +1,4 @@
-// Copyright 2023 Zinc Labs Inc.
+// Copyright 2024 Zinc Labs Inc.
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -42,17 +42,11 @@ use openobserve::{
     handler::{
         grpc::{
             auth::check_auth,
-            cluster_rpc::{
-                event_server::EventServer, filelist_server::FilelistServer,
-                metrics_server::MetricsServer, search_server::SearchServer,
-                usage_server::UsageServer,
-            },
             request::{
                 event::Eventer,
                 file_list::Filelister,
                 logs::LogsServer,
                 metrics::{ingester::Ingester, querier::Querier},
-                search::Searcher,
                 traces::TraceServer,
                 usage::UsageServerImpl,
             },
@@ -60,7 +54,7 @@ use openobserve::{
         http::router::*,
     },
     job, router,
-    service::{db, distinct_values},
+    service::{db, metadata, search::SEARCH_SERVER},
 };
 use opentelemetry::KeyValue;
 use opentelemetry_otlp::WithExportConfig;
@@ -70,6 +64,10 @@ use opentelemetry_proto::tonic::collector::{
     trace::v1::trace_service_server::TraceServiceServer,
 };
 use opentelemetry_sdk::{propagation::TraceContextPropagator, trace as sdktrace, Resource};
+use proto::cluster_rpc::{
+    event_server::EventServer, filelist_server::FilelistServer, metrics_server::MetricsServer,
+    search_server::SearchServer, usage_server::UsageServer,
+};
 #[cfg(feature = "profiling")]
 use pyroscope::PyroscopeAgent;
 #[cfg(feature = "profiling")]
@@ -93,17 +91,40 @@ use tracing_subscriber::{
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
+    #[cfg(feature = "tokio-console")]
+    console_subscriber::init();
+
+    // let tokio steal the thread
+    let rt_handle = tokio::runtime::Handle::current();
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_secs(10));
+            rt_handle.spawn(std::future::ready(()));
+        }
+    });
+
+    // setup profiling
     #[cfg(feature = "profiling")]
-    let agent = PyroscopeAgent::builder(
-        &CONFIG.profiling.pyroscope_server_url,
-        &CONFIG.profiling.pyroscope_project_name,
-    )
-    .tags([("Host", "Rust")].to_vec())
-    .backend(pprof_backend(PprofConfig::new().sample_rate(100)))
-    .build()
-    .expect("Failed to setup pyroscope agent");
-    #[cfg(feature = "profiling")]
-    let agent_running = agent.start().expect("Failed to start pyroscope agent");
+    let agent = if !CONFIG.profiling.enabled {
+        None
+    } else {
+        let agent =
+            PyroscopeAgent::builder(&CONFIG.profiling.server_url, &CONFIG.profiling.project_name)
+                .tags(
+                    [
+                        ("role", CONFIG.common.node_role.as_str()),
+                        ("instance", CONFIG.common.instance_name.as_str()),
+                        ("version", VERSION),
+                    ]
+                    .to_vec(),
+                )
+                .backend(pprof_backend(PprofConfig::new().sample_rate(100)))
+                .build()
+                .expect("Failed to setup pyroscope agent");
+        #[cfg(feature = "profiling")]
+        let agent_running = agent.start().expect("Failed to start pyroscope agent");
+        Some(agent_running)
+    };
 
     // cli mode
     if cli::cli().await? {
@@ -111,7 +132,13 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 
     // setup logs
-    let _guard: Option<WorkerGuard> = if CONFIG.log.events_enabled {
+    #[cfg(feature = "tokio-console")]
+    let enable_tokio_console = true;
+    #[cfg(not(feature = "tokio-console"))]
+    let enable_tokio_console = false;
+    let _guard: Option<WorkerGuard> = if enable_tokio_console {
+        None
+    } else if CONFIG.log.events_enabled {
         let logger = zo_logger::ZoLogger {
             sender: zo_logger::EVENT_SENDER.clone(),
         };
@@ -177,12 +204,16 @@ async fn main() -> Result<(), anyhow::Error> {
         .await
         .expect("EnrichmentTables cache failed");
 
-    tokio::task::spawn(async move { zo_logger::send_logs().await });
-    tokio::task::spawn(async move {
-        meta::telemetry::Telemetry::new()
-            .event("OpenObserve - Starting server", None, false)
-            .await;
-    });
+    if CONFIG.log.events_enabled {
+        tokio::task::spawn(async move { zo_logger::send_logs().await });
+    }
+    if CONFIG.common.telemetry_enabled {
+        tokio::task::spawn(async move {
+            meta::telemetry::Telemetry::new()
+                .event("OpenObserve - Starting server", None, false)
+                .await;
+        });
+    }
 
     // init http server
     if let Err(e) = init_http_server().await {
@@ -202,7 +233,7 @@ async fn main() -> Result<(), anyhow::Error> {
     // flush WAL cache to disk
     common_infra::wal::flush_all_to_disk().await;
     // flush distinct values
-    _ = distinct_values::close().await;
+    _ = metadata::close().await;
     // flush compact offset cache to disk disk
     _ = db::compact::files::sync_cache_to_db().await;
     // flush db
@@ -210,16 +241,19 @@ async fn main() -> Result<(), anyhow::Error> {
     _ = db.close().await;
 
     // stop telemetry
-    meta::telemetry::Telemetry::new()
-        .event("OpenObserve - Server stopped", None, false)
-        .await;
+    if CONFIG.common.telemetry_enabled {
+        meta::telemetry::Telemetry::new()
+            .event("OpenObserve - Server stopped", None, false)
+            .await;
+    }
 
     log::info!("server stopped");
 
     #[cfg(feature = "profiling")]
-    let agent_ready = agent_running.stop().unwrap();
-    #[cfg(feature = "profiling")]
-    agent_ready.shutdown();
+    if let Some(agent) = agent {
+        let agent_ready = agent.stop().unwrap();
+        agent_ready.shutdown();
+    }
 
     Ok(())
 }
@@ -237,7 +271,7 @@ fn init_common_grpc_server(
     let event_svc = EventServer::new(Eventer)
         .send_compressed(CompressionEncoding::Gzip)
         .accept_compressed(CompressionEncoding::Gzip);
-    let search_svc = SearchServer::new(Searcher)
+    let search_svc = SearchServer::new(SEARCH_SERVER.clone())
         .send_compressed(CompressionEncoding::Gzip)
         .accept_compressed(CompressionEncoding::Gzip);
     let filelist_svc = FilelistServer::new(Filelister)
@@ -346,18 +380,25 @@ async fn init_http_server() -> Result<(), anyhow::Error> {
         );
         let mut app = App::new().wrap(prometheus.clone());
         if is_router(&LOCAL_NODE_ROLE) {
-            app = app.service(
-                // if `CONFIG.common.base_uri` is empty, scope("") still works as expected.
-                web::scope(&CONFIG.common.base_uri)
-                    .service(router::http::config)
-                    .service(router::http::config_paths)
-                    .service(router::http::api)
-                    .service(router::http::aws)
-                    .service(router::http::gcp)
-                    .service(router::http::rum)
-                    .configure(get_basic_routes)
-                    .configure(get_proxy_routes),
-            )
+            let client = awc::Client::builder()
+                .connector(awc::Connector::new().limit(CONFIG.route.max_connections))
+                .timeout(Duration::from_secs(CONFIG.route.timeout))
+                .disable_redirects()
+                .finish();
+            app = app
+                .service(
+                    // if `CONFIG.common.base_uri` is empty, scope("") still works as expected.
+                    web::scope(&CONFIG.common.base_uri)
+                        .service(router::http::config)
+                        .service(router::http::config_paths)
+                        .service(router::http::api)
+                        .service(router::http::aws)
+                        .service(router::http::gcp)
+                        .service(router::http::rum)
+                        .configure(get_basic_routes)
+                        .configure(get_proxy_routes),
+                )
+                .app_data(web::Data::new(client))
         } else {
             app = app.service(
                 web::scope(&CONFIG.common.base_uri)
@@ -378,7 +419,7 @@ async fn init_http_server() -> Result<(), anyhow::Error> {
             .wrap(RequestTracing::new())
     })
     .keep_alive(KeepAlive::Timeout(Duration::from_secs(max(
-        5,
+        15,
         CONFIG.limit.keep_alive,
     ))))
     .client_request_timeout(Duration::from_secs(max(5, CONFIG.limit.request_timeout)))

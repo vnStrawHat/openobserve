@@ -1,4 +1,4 @@
-// Copyright 2023 Zinc Labs Inc.
+// Copyright 2024 Zinc Labs Inc.
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -27,6 +27,7 @@ use config::{
     ider,
     meta::{
         cluster::{Node, Role},
+        search,
         stream::{FileKey, PartitionTimeLevel, QueryPartitionStrategy, StreamType},
     },
     utils::{flatten, json, str::find},
@@ -39,6 +40,8 @@ use infra::{
 };
 use itertools::Itertools;
 use once_cell::sync::Lazy;
+use opentelemetry::trace::TraceContextExt;
+use proto::cluster_rpc;
 use tokio::sync::Mutex;
 use tonic::{codec::CompressionEncoding, metadata::MetadataValue, transport::Channel, Request};
 use tracing::{info_span, Instrument};
@@ -50,11 +53,10 @@ use crate::{
         infra::cluster::{self, get_node_from_consistent_hash},
         meta::{
             functions::VRLResultResolver,
-            search,
-            stream::{ScanStats, StreamParams, StreamPartition},
+            stream::{StreamParams, StreamPartition},
         },
     },
-    handler::grpc::cluster_rpc,
+    handler::grpc::request::search::Searcher,
     service::{file_list, format_partition_key, stream},
 };
 
@@ -65,29 +67,71 @@ pub(crate) mod sql;
 pub(crate) static QUEUE_LOCKER: Lazy<Arc<Mutex<bool>>> =
     Lazy::new(|| Arc::new(Mutex::const_new(false)));
 
+pub static SEARCH_SERVER: Lazy<Searcher> = Lazy::new(Searcher::new);
+
 #[tracing::instrument(name = "service:search:enter", skip(req))]
 pub async fn search(
-    session_id: &str,
+    trace_id: &str,
     org_id: &str,
     stream_type: StreamType,
+    user_id: Option<String>,
     req: &search::Request,
 ) -> Result<search::Response, Error> {
-    let session_id = if session_id.is_empty() {
-        ider::uuid()
+    let trace_id = if trace_id.is_empty() {
+        if CONFIG.common.tracing_enabled {
+            let ctx = tracing::Span::current().context();
+            ctx.span().span_context().trace_id().to_string()
+        } else {
+            ider::uuid()
+        }
     } else {
-        session_id.to_string()
+        trace_id.to_string()
     };
+
+    #[cfg(feature = "enterprise")]
+    {
+        let sql = Some(req.query.sql.clone());
+        let start_time = Some(req.query.start_time);
+        let end_time = Some(req.query.end_time);
+        // set search task
+        SEARCH_SERVER
+            .insert(
+                trace_id.clone(),
+                o2_enterprise::enterprise::search::TaskStatus::new(
+                    vec![],
+                    true,
+                    user_id,
+                    Some(org_id.to_string()),
+                    Some(stream_type.to_string()),
+                    sql,
+                    start_time,
+                    end_time,
+                ),
+            )
+            .await;
+    }
+
     let mut req: cluster_rpc::SearchRequest = req.to_owned().into();
-    req.job.as_mut().unwrap().session_id = session_id;
+    req.job.as_mut().unwrap().trace_id = trace_id.clone();
     req.org_id = org_id.to_string();
     req.stype = cluster_rpc::SearchType::User as i32;
     req.stream_type = stream_type.to_string();
-    search_in_cluster(req).await
+    let res = search_in_cluster(req).await;
+
+    // remove task because task if finished
+    #[cfg(feature = "enterprise")]
+    SEARCH_SERVER.remove(&trace_id).await;
+
+    // do this because of clippy warning
+    match res {
+        Ok(res) => Ok(res),
+        Err(e) => Err(e),
+    }
 }
 
 #[tracing::instrument(name = "service:search_partition:enter", skip(req))]
 pub async fn search_partition(
-    session_id: &str,
+    trace_id: &str,
     org_id: &str,
     stream_type: StreamType,
     req: &search::SearchPartitionRequest,
@@ -111,7 +155,7 @@ pub async fn search_partition(
     let partition_time_level =
         stream::unwrap_partition_time_level(stream_settings.partition_time_level, stream_type);
     let files = get_file_list(
-        session_id,
+        trace_id,
         &meta,
         stream_type,
         partition_time_level,
@@ -122,6 +166,10 @@ pub async fn search_partition(
     let nodes = cluster::get_cached_online_querier_nodes()
         .await
         .unwrap_or_default();
+    if nodes.is_empty() {
+        log::error!("no querier node online");
+        return Err(Error::Message("no querier node online".to_string()));
+    }
     let cpu_cores = nodes.iter().map(|n| n.cpu_num).sum::<u64>() as usize;
 
     let (records, original_size, compressed_size) =
@@ -135,7 +183,7 @@ pub async fn search_partition(
                 )
             });
     let mut resp = search::SearchPartitionResponse {
-        session_id: session_id.to_string(),
+        trace_id: trace_id.to_string(),
         file_num: files.len(),
         records: records as usize,
         original_size: original_size as usize,
@@ -177,9 +225,9 @@ pub async fn search_partition(
     Ok(resp)
 }
 
-#[tracing::instrument(skip(sql), fields(session_id = ?_session_id, org_id = sql.org_id, stream_name = sql.stream_name))]
+#[tracing::instrument(skip(sql), fields(trace_id = ?_trace_id, org_id = sql.org_id, stream_name = sql.stream_name))]
 async fn get_file_list(
-    _session_id: &str,
+    _trace_id: &str,
     sql: &sql::Sql,
     stream_type: StreamType,
     time_level: PartitionTimeLevel,
@@ -225,11 +273,11 @@ async fn get_file_list(
 #[tracing::instrument(
     name = "service:search:cluster",
     skip(req),
-    fields(session_id = req.job.as_ref().unwrap().session_id, org_id = req.org_id)
+    fields(trace_id = req.job.as_ref().unwrap().trace_id, org_id = req.org_id)
 )]
 async fn search_in_cluster(mut req: cluster_rpc::SearchRequest) -> Result<search::Response, Error> {
     let start = std::time::Instant::now();
-    let session_id = req.job.as_ref().unwrap().session_id.clone();
+    let trace_id = req.job.as_ref().unwrap().trace_id.clone();
 
     // handle request time range
     let stream_type = StreamType::from(req.stream_type.as_str());
@@ -248,14 +296,15 @@ async fn search_in_cluster(mut req: cluster_rpc::SearchRequest) -> Result<search
 
     let querier_num = nodes.iter().filter(|node| is_querier(&node.role)).count();
     if querier_num == 0 {
+        log::error!("no querier node online");
         return Err(Error::Message("no querier node online".to_string()));
     }
 
     // partition request, here plus 1 second, because division is integer, maybe
     // lose some precision
     let job = cluster_rpc::Job {
-        session_id: session_id.clone(),
-        job: session_id[0..6].to_string(), // take the frist 6 characters as job id
+        trace_id: trace_id.clone(),
+        job: trace_id[0..6].to_string(), // take the frist 6 characters as job id
         stage: 0,
         partition: 0,
     };
@@ -263,7 +312,7 @@ async fn search_in_cluster(mut req: cluster_rpc::SearchRequest) -> Result<search
     let is_inverted_index = !meta.fts_terms.is_empty();
 
     log::info!(
-        "[session_id {session_id}] search: is_agg_query {:?} is_inverted_index {:?}",
+        "[trace_id {trace_id}] search: is_agg_query {:?} is_inverted_index {:?}",
         !req.aggs.is_empty(),
         is_inverted_index
     );
@@ -352,8 +401,6 @@ async fn search_in_cluster(mut req: cluster_rpc::SearchRequest) -> Result<search
             let mut term_map: HashMap<String, Vec<String>> = HashMap::new();
             let mut term_counts: HashMap<String, u64> = HashMap::new();
 
-            println!("index got file_list: {:?}", sorted_data.len());
-
             for (term, filename, count, _timestamp) in sorted_data {
                 let term = term.as_str();
                 for search_term in terms.iter() {
@@ -369,7 +416,6 @@ async fn search_in_cluster(mut req: cluster_rpc::SearchRequest) -> Result<search
                     }
                 }
             }
-            println!("term_map: {:?}", term_map);
             (
                 term_map
                     .into_iter()
@@ -408,7 +454,7 @@ async fn search_in_cluster(mut req: cluster_rpc::SearchRequest) -> Result<search
     } else {
         (
             get_file_list(
-                &session_id,
+                &trace_id,
                 &meta,
                 stream_type,
                 partition_time_level,
@@ -421,7 +467,7 @@ async fn search_in_cluster(mut req: cluster_rpc::SearchRequest) -> Result<search
 
     let file_list_took = start.elapsed().as_millis() as usize;
     log::info!(
-        "[session_id {session_id}] search: get file_list time_range: {:?}, num: {}, took: {}",
+        "[trace_id {trace_id}] search: get file_list time_range: {:?}, num: {}, took: {}",
         meta.meta.time_range,
         file_list.len(),
         file_list_took,
@@ -464,7 +510,7 @@ async fn search_in_cluster(mut req: cluster_rpc::SearchRequest) -> Result<search
     }
     // 3. process the search in the work group
     #[cfg(feature = "enterprise")]
-    if let Err(e) = work_group.as_ref().unwrap().process(&session_id).await {
+    if let Err(e) = work_group.as_ref().unwrap().process(&trace_id).await {
         dist_lock::unlock(&locker).await?;
         return Err(Error::Message(e.to_string()));
     }
@@ -472,7 +518,7 @@ async fn search_in_cluster(mut req: cluster_rpc::SearchRequest) -> Result<search
     dist_lock::unlock(&locker).await?;
     let took_wait = start.elapsed().as_millis() as usize - file_list_took;
     log::info!(
-        "[session_id {session_id}] search: wait in queue took: {}",
+        "[trace_id {trace_id}] search: wait in queue took: {}",
         took_wait,
     );
 
@@ -509,9 +555,31 @@ async fn search_in_cluster(mut req: cluster_rpc::SearchRequest) -> Result<search
     };
 
     log::info!(
-        "[session_id {session_id}] search: file_list partition, time_range: {:?}, num: {file_num}, offset: {offset}",
+        "[trace_id {trace_id}] search: file_list partition, time_range: {:?}, num: {file_num}, offset: {offset}",
         meta.meta.time_range
     );
+
+    #[cfg(feature = "enterprise")]
+    {
+        let mut records = 0;
+        let mut original_size = 0;
+        let mut compressed_size = 0;
+        for file in file_list.iter() {
+            let file_meta = &file.meta;
+            records += file_meta.records;
+            original_size += file_meta.original_size;
+            compressed_size += file_meta.compressed_size;
+        }
+        SEARCH_SERVER
+            .add_file_stats(
+                &trace_id,
+                file_list.len() as i64,
+                records,
+                original_size,
+                compressed_size,
+            )
+            .await;
+    }
 
     // set this value to null & use it later on results ,
     // this being to avoid performance impact of query fn being applied during query
@@ -523,7 +591,7 @@ async fn search_in_cluster(mut req: cluster_rpc::SearchRequest) -> Result<search
     let mut tasks = Vec::new();
     let mut offset_start: usize = 0;
     for (partition_no, node) in nodes.iter().cloned().enumerate() {
-        let session_id = session_id.clone();
+        let trace_id = trace_id.clone();
         let mut req = req.clone();
         let mut job = job.clone();
         job.partition = partition_no as i32;
@@ -569,11 +637,28 @@ async fn search_in_cluster(mut req: cluster_rpc::SearchRequest) -> Result<search
         let node_addr = node.grpc_addr.clone();
         let grpc_span = info_span!(
             "service:search:cluster:grpc_search",
-            session_id,
+            trace_id,
             org_id = req.org_id,
             node_id = node.id,
             node_addr = node_addr.as_str(),
         );
+
+        #[cfg(feature = "enterprise")]
+        let (abort_sender, abort_receiver) = tokio::sync::oneshot::channel();
+        #[cfg(feature = "enterprise")]
+        if SEARCH_SERVER
+            .insert_sender(&trace_id, abort_sender)
+            .await
+            .is_err()
+        {
+            log::info!(
+                "[trace_id {trace_id}] search->grpc: search canceled before call search->grpc"
+            );
+            return Err(Error::ErrorCode(ErrorCodes::SearchCancelQuery(format!(
+                "[trace_id {trace_id}] search->grpc: search canceled before call search->grpc"
+            ))));
+        }
+
         let task = tokio::task::spawn(
             async move {
                 let org_id: MetadataValue<_> = req
@@ -590,7 +675,7 @@ async fn search_in_cluster(mut req: cluster_rpc::SearchRequest) -> Result<search
                     )
                 });
 
-                log::info!("[session_id {session_id}] search->grpc: request node: {}, is_querier: {}, files: {req_files}", &node_addr, is_querier);
+                log::info!("[trace_id {trace_id}] search->grpc: request node: {}, is_querier: {}, files: {req_files}", &node_addr, is_querier);
 
                 let token: MetadataValue<_> = cluster::get_internal_grpc_token()
                     .parse()
@@ -600,7 +685,7 @@ async fn search_in_cluster(mut req: cluster_rpc::SearchRequest) -> Result<search
                     .connect()
                     .await
                     .map_err(|err| {
-                        log::error!("[session_id {session_id}] search->grpc: node: {}, connect err: {:?}", &node.grpc_addr, err);
+                        log::error!("[trace_id {trace_id}] search->grpc: node: {}, connect err: {:?}", &node.grpc_addr, err);
                         server_internal_error("connect search node error")
                     })?;
                 let mut client = cluster_rpc::search_client::SearchClient::with_interceptor(
@@ -617,20 +702,34 @@ async fn search_in_cluster(mut req: cluster_rpc::SearchRequest) -> Result<search
                     .accept_compressed(CompressionEncoding::Gzip)
                     .max_decoding_message_size(CONFIG.grpc.max_message_size * 1024 * 1024)
                     .max_encoding_message_size(CONFIG.grpc.max_message_size * 1024 * 1024);
-                let response: cluster_rpc::SearchResponse = match client.search(request).await {
-                    Ok(res) => res.into_inner(),
-                    Err(err) => {
-                        log::error!("[session_id {session_id}] search->grpc: node: {}, search err: {:?}", &node.grpc_addr, err);
-                        if err.code() == tonic::Code::Internal {
-                            let err = ErrorCodes::from_json(err.message())?;
-                            return Err(Error::ErrorCode(err));
+                let response;
+                tokio::select! {
+                    result = client.search(request) => {
+                        match result {
+                            Ok(res) => response = res.into_inner(),
+                            Err(err) => {
+                                log::error!("[trace_id {trace_id}] search->grpc: node: {}, search err: {:?}", &node.grpc_addr, err);
+                                if err.code() == tonic::Code::Internal {
+                                    let err = ErrorCodes::from_json(err.message())?;
+                                    return Err(Error::ErrorCode(err));
+                                }
+                                return Err(server_internal_error("search node error"));
+                            }
                         }
-                        return Err(server_internal_error("search node error"));
                     }
-                };
+                    _ = async {
+                        #[cfg(feature = "enterprise")]
+                        let _ = abort_receiver.await;
+                        #[cfg(not(feature = "enterprise"))]
+                        futures::future::pending::<()>().await;
+                    } => {
+                        log::info!("[trace_id {trace_id}] search->grpc: cancel search in node: {:?}", &node.grpc_addr);
+                        return Err(Error::ErrorCode(ErrorCodes::SearchCancelQuery(format!("[trace_id {trace_id}] search->grpc: search canceled"))));
+                    }
+                }
 
                 log::info!(
-                    "[session_id {session_id}] search->grpc: response node: {}, is_querier: {}, total: {}, took: {}, files: {}, scan_size: {}",
+                    "[trace_id {trace_id}] search->grpc: response node: {}, is_querier: {}, total: {}, took: {}, files: {}, scan_size: {}",
                     &node.grpc_addr,
                     is_querier,
                     response.total,
@@ -658,7 +757,7 @@ async fn search_in_cluster(mut req: cluster_rpc::SearchRequest) -> Result<search
                     work_group
                         .as_ref()
                         .unwrap()
-                        .done(&session_id)
+                        .done(&trace_id)
                         .await
                         .map_err(|e| Error::Message(e.to_string()))?;
                     return Err(err);
@@ -672,7 +771,7 @@ async fn search_in_cluster(mut req: cluster_rpc::SearchRequest) -> Result<search
                 work_group
                     .as_ref()
                     .unwrap()
-                    .done(&session_id)
+                    .done(&trace_id)
                     .await
                     .map_err(|e| Error::Message(e.to_string()))?;
                 return Err(Error::ErrorCode(ErrorCodes::ServerInternalError(
@@ -683,7 +782,7 @@ async fn search_in_cluster(mut req: cluster_rpc::SearchRequest) -> Result<search
     }
 
     // merge multiple instances data
-    let mut scan_stats = ScanStats::new();
+    let mut scan_stats = search::ScanStats::new();
     let mut batches: HashMap<String, Vec<RecordBatch>> = HashMap::new();
     let sql = Arc::new(meta);
     for (node, resp) in results {
@@ -743,19 +842,59 @@ async fn search_in_cluster(mut req: cluster_rpc::SearchRequest) -> Result<search
             }
             (sql.aggs.get(agg_name).unwrap().0.clone(), vec![])
         };
-        let batch = match datafusion::exec::merge(
-            &sql.org_id,
-            sql.meta.offset,
-            sql.meta.limit,
-            &merge_sql,
-            &batch,
-            &select_fields,
-            true,
-        )
-        .await
+
+        #[cfg(feature = "enterprise")]
+        let (abort_sender, abort_receiver) = tokio::sync::oneshot::channel();
+        #[cfg(feature = "enterprise")]
+        if SEARCH_SERVER
+            .insert_sender(&trace_id, abort_sender)
+            .await
+            .is_err()
         {
-            Ok(res) => res,
-            Err(err) => {
+            log::info!(
+                "[trace_id {trace_id}] search->grpc: search canceled after get result from remote node"
+            );
+            return Err(Error::ErrorCode(ErrorCodes::SearchCancelQuery(format!(
+                "[trace_id {trace_id}] search->grpc: search canceled after get result from remote node"
+            ))));
+        }
+
+        let merge_batch;
+        tokio::select! {
+            res = datafusion::exec::merge(
+                &sql.org_id,
+                sql.meta.offset,
+                sql.meta.limit,
+                &merge_sql,
+                &batch,
+                &select_fields,
+                true,
+            ) => {
+                match res {
+                    Ok(res) => merge_batch = res,
+                    Err(err) => {
+                        // search done, release lock
+                        #[cfg(not(feature = "enterprise"))]
+                        dist_lock::unlock(&locker).await?;
+                        #[cfg(feature = "enterprise")]
+                        work_group
+                            .as_ref()
+                            .unwrap()
+                            .done(&trace_id)
+                            .await
+                            .map_err(|e| Error::Message(e.to_string()))?;
+                        return Err(Error::ErrorCode(ErrorCodes::ServerInternalError(
+                            err.to_string(),
+                        )));
+                    }
+                }
+            }
+            _ = async {
+                #[cfg(feature = "enterprise")]
+                let _ = abort_receiver.await;
+                #[cfg(not(feature = "enterprise"))]
+                futures::future::pending::<()>().await;
+            } => {
                 // search done, release lock
                 #[cfg(not(feature = "enterprise"))]
                 dist_lock::unlock(&locker).await?;
@@ -763,16 +902,18 @@ async fn search_in_cluster(mut req: cluster_rpc::SearchRequest) -> Result<search
                 work_group
                     .as_ref()
                     .unwrap()
-                    .done(&session_id)
+                    .done(&trace_id)
                     .await
                     .map_err(|e| Error::Message(e.to_string()))?;
-                return Err(Error::ErrorCode(ErrorCodes::ServerInternalError(
-                    err.to_string(),
-                )));
+                log::info!("[trace_id {trace_id}] search->cluster: final merge task is cancel");
+                return Err(Error::ErrorCode(ErrorCodes::SearchCancelQuery(format!("[trace_id {trace_id}] search->cluster: final merge task is cancel"))));
             }
-        };
-        merge_batches.insert(name, batch);
+        }
+
+        merge_batches.insert(name, merge_batch);
     }
+
+    log::info!("[trace_id {trace_id}] final merge task finish");
 
     // search done, release lock
     #[cfg(not(feature = "enterprise"))]
@@ -781,7 +922,7 @@ async fn search_in_cluster(mut req: cluster_rpc::SearchRequest) -> Result<search
     work_group
         .as_ref()
         .unwrap()
-        .done(&session_id)
+        .done(&trace_id)
         .await
         .map_err(|e| Error::Message(e.to_string()))?;
 
@@ -824,10 +965,7 @@ async fn search_in_cluster(mut req: cluster_rpc::SearchRequest) -> Result<search
                         Some(program)
                     }
                     Err(err) => {
-                        log::error!(
-                            "[session_id {session_id}] search->vrl: compile err: {:?}",
-                            err
-                        );
+                        log::error!("[trace_id {trace_id}] search->vrl: compile err: {:?}", err);
                         result.function_error = err.to_string();
                         None
                     }
@@ -933,13 +1071,267 @@ async fn search_in_cluster(mut req: cluster_rpc::SearchRequest) -> Result<search
     }
 
     log::info!(
-        "[session_id {session_id}] search->result: total: {}, took: {}, scan_size: {}",
+        "[trace_id {trace_id}] search->result: total: {}, took: {}, scan_size: {}",
         result.total,
         result.took,
         result.scan_size,
     );
 
     Ok(result)
+}
+
+#[cfg(feature = "enterprise")]
+pub async fn job_status() -> Result<search::JobStatusResponse, Error> {
+    // get nodes from cluster
+    let mut nodes = cluster::get_cached_online_query_nodes().await.unwrap();
+    // sort nodes by node_id this will improve hit cache ratio
+    nodes.dedup_by(|a, b| a.grpc_addr == b.grpc_addr);
+    let nodes = nodes;
+
+    // make cluster request
+    let mut tasks = Vec::new();
+    for node in nodes.iter().cloned() {
+        let node_addr = node.grpc_addr.clone();
+        let grpc_span = info_span!(
+            "service:search:cluster:grpc_job_status",
+            node_id = node.id,
+            node_addr = node_addr.as_str(),
+        );
+
+        let task = tokio::task::spawn(
+            async move {
+                let mut request = tonic::Request::new(proto::cluster_rpc::JobStatusRequest {});
+
+                opentelemetry::global::get_text_map_propagator(|propagator| {
+                    propagator.inject_context(
+                        &tracing::Span::current().context(),
+                        &mut MetadataMap(request.metadata_mut()),
+                    )
+                });
+
+                let token: MetadataValue<_> = cluster::get_internal_grpc_token()
+                    .parse()
+                    .map_err(|_| Error::Message("invalid token".to_string()))?;
+                let channel = Channel::from_shared(node_addr)
+                    .unwrap()
+                    .connect()
+                    .await
+                    .map_err(|err| {
+                        log::error!(
+                            "search->grpc: node: {}, connect err: {:?}",
+                            &node.grpc_addr,
+                            err
+                        );
+                        server_internal_error("connect search node error")
+                    })?;
+                let mut client = cluster_rpc::search_client::SearchClient::with_interceptor(
+                    channel,
+                    move |mut req: Request<()>| {
+                        req.metadata_mut().insert("authorization", token.clone());
+                        //  req.metadata_mut()
+                        //      .insert(CONFIG.grpc.org_header_key.as_str(), org_id.clone());
+                        Ok(req)
+                    },
+                );
+                client = client
+                    .send_compressed(CompressionEncoding::Gzip)
+                    .accept_compressed(CompressionEncoding::Gzip)
+                    .max_decoding_message_size(CONFIG.grpc.max_message_size * 1024 * 1024)
+                    .max_encoding_message_size(CONFIG.grpc.max_message_size * 1024 * 1024);
+                let response = match client.job_status(request).await {
+                    Ok(res) => res.into_inner(),
+                    Err(err) => {
+                        log::error!(
+                            "search->grpc: node: {}, search err: {:?}",
+                            &node.grpc_addr,
+                            err
+                        );
+                        if err.code() == tonic::Code::Internal {
+                            let err = ErrorCodes::from_json(err.message())?;
+                            return Err(Error::ErrorCode(err));
+                        }
+                        return Err(server_internal_error("search node error"));
+                    }
+                };
+                Ok(response)
+            }
+            .instrument(grpc_span),
+        );
+        tasks.push(task);
+    }
+
+    let mut results = Vec::new();
+    for task in tasks {
+        match task.await {
+            Ok(res) => match res {
+                Ok(res) => results.push(res),
+                Err(err) => {
+                    return Err(err);
+                }
+            },
+            Err(e) => {
+                return Err(Error::ErrorCode(ErrorCodes::ServerInternalError(
+                    e.to_string(),
+                )));
+            }
+        }
+    }
+
+    let mut status = vec![];
+    let mut set = HashSet::new();
+    for result in results.into_iter().flat_map(|v| v.status.into_iter()) {
+        if set.contains(&result.trace_id) {
+            continue;
+        } else {
+            set.insert(result.trace_id.clone());
+        }
+        let query = result.query.as_ref().map(|query| search::QueryInfo {
+            sql: query.sql.clone(),
+            start_time: query.start_time,
+            end_time: query.end_time,
+        });
+        let scan_stats = result
+            .scan_stats
+            .as_ref()
+            .map(|scan_stats| search::ScanStats {
+                files: scan_stats.files,
+                records: scan_stats.records,
+                original_size: scan_stats.original_size / 1024 / 1024, // change to MB
+                compressed_size: scan_stats.compressed_size / 1024 / 1024, // change to MB
+            });
+        let job_status = if result.is_queue {
+            "waiting"
+        } else {
+            "processing"
+        };
+        status.push(search::JobStatus {
+            trace_id: result.trace_id,
+            created_at: result.created_at,
+            started_at: result.started_at,
+            status: job_status.to_string(),
+            user_id: result.user_id,
+            org_id: result.org_id,
+            stream_type: result.stream_type,
+            query,
+            scan_stats,
+        });
+    }
+
+    Ok(search::JobStatusResponse { status })
+}
+
+#[cfg(feature = "enterprise")]
+pub async fn cancel_job(trace_id: &str) -> Result<search::CancelJobResponse, Error> {
+    // get nodes from cluster
+    let mut nodes = cluster::get_cached_online_query_nodes().await.unwrap();
+    // sort nodes by node_id this will improve hit cache ratio
+    nodes.dedup_by(|a, b| a.grpc_addr == b.grpc_addr);
+    let nodes = nodes;
+
+    // make cluster request
+    let mut tasks = Vec::new();
+    for node in nodes.iter().cloned() {
+        let node_addr = node.grpc_addr.clone();
+        let grpc_span = info_span!(
+            "service:search:cluster:grpc_cancel_job",
+            node_id = node.id,
+            node_addr = node_addr.as_str(),
+        );
+
+        let trace_id = trace_id.to_string();
+        let task = tokio::task::spawn(
+            async move {
+                let mut request =
+                    tonic::Request::new(proto::cluster_rpc::CancelJobRequest { trace_id });
+                // request.set_timeout(Duration::from_secs(CONFIG.grpc.timeout));
+
+                opentelemetry::global::get_text_map_propagator(|propagator| {
+                    propagator.inject_context(
+                        &tracing::Span::current().context(),
+                        &mut MetadataMap(request.metadata_mut()),
+                    )
+                });
+
+                let token: MetadataValue<_> = cluster::get_internal_grpc_token()
+                    .parse()
+                    .map_err(|_| Error::Message("invalid token".to_string()))?;
+                let channel = Channel::from_shared(node_addr)
+                    .unwrap()
+                    .connect()
+                    .await
+                    .map_err(|err| {
+                        log::error!(
+                            "search->grpc: node: {}, connect err: {:?}",
+                            &node.grpc_addr,
+                            err
+                        );
+                        server_internal_error("connect search node error")
+                    })?;
+                let mut client = cluster_rpc::search_client::SearchClient::with_interceptor(
+                    channel,
+                    move |mut req: Request<()>| {
+                        req.metadata_mut().insert("authorization", token.clone());
+                        //  req.metadata_mut()
+                        //      .insert(CONFIG.grpc.org_header_key.as_str(), org_id.clone());
+                        Ok(req)
+                    },
+                );
+                client = client
+                    .send_compressed(CompressionEncoding::Gzip)
+                    .accept_compressed(CompressionEncoding::Gzip)
+                    .max_decoding_message_size(CONFIG.grpc.max_message_size * 1024 * 1024)
+                    .max_encoding_message_size(CONFIG.grpc.max_message_size * 1024 * 1024);
+                let response = match client.cancel_job(request).await {
+                    Ok(res) => res.into_inner(),
+                    Err(err) => {
+                        log::error!(
+                            "search->grpc: node: {}, search err: {:?}",
+                            &node.grpc_addr,
+                            err
+                        );
+                        if err.code() == tonic::Code::Internal {
+                            let err = ErrorCodes::from_json(err.message())?;
+                            return Err(Error::ErrorCode(err));
+                        }
+                        return Err(server_internal_error("search node error"));
+                    }
+                };
+                Ok(response)
+            }
+            .instrument(grpc_span),
+        );
+        tasks.push(task);
+    }
+
+    let mut results = Vec::new();
+    for task in tasks {
+        match task.await {
+            Ok(res) => match res {
+                Ok(res) => results.push(res),
+                Err(err) => {
+                    return Err(err);
+                }
+            },
+            Err(e) => {
+                return Err(Error::ErrorCode(ErrorCodes::ServerInternalError(
+                    e.to_string(),
+                )));
+            }
+        }
+    }
+
+    let mut is_success = false;
+    for res in results {
+        if res.is_success {
+            is_success = true;
+            break;
+        }
+    }
+
+    Ok(search::CancelJobResponse {
+        trace_id: trace_id.to_string(),
+        is_success,
+    })
 }
 
 fn partition_file_by_bytes(file_keys: &[FileKey], num_nodes: usize) -> Vec<Vec<&FileKey>> {
@@ -1243,7 +1635,7 @@ mod tests {
 
     #[test]
     fn test_matches_by_partition_key_with_sql() {
-        use crate::common::meta::sql;
+        use config::meta::sql;
 
         let path = "files/default/logs/gke-fluentbit/2023/04/14/08/kuberneteshost=gke-dev1/kubernetesnamespacename=ziox-dev/7052558621820981249.parquet";
         let sqls = vec![

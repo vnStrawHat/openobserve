@@ -1,4 +1,4 @@
-// Copyright 2023 Zinc Labs Inc.
+// Copyright 2024 Zinc Labs Inc.
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -15,11 +15,21 @@
 
 use std::collections::HashMap;
 
-use config::utils::{base64, json};
+use proto::cluster_rpc;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::service::search::datafusion::storage::StorageType;
+use crate::{
+    ider,
+    utils::{base64, json},
+};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StorageType {
+    Memory,
+    Wal,
+    Tmpfs,
+}
 
 #[derive(Clone, Debug)]
 pub struct Session {
@@ -134,14 +144,14 @@ impl Request {
     pub fn decode(&mut self) -> Result<(), std::io::Error> {
         match self.encoding {
             RequestEncoding::Base64 => {
-                self.query.sql = match base64::decode(&self.query.sql) {
+                self.query.sql = match base64::decode_url(&self.query.sql) {
                     Ok(v) => v,
                     Err(e) => {
                         return Err(e);
                     }
                 };
                 for (_, v) in self.aggs.iter_mut() {
-                    *v = match base64::decode(v) {
+                    *v = match base64::decode_url(v) {
                         Ok(v) => v,
                         Err(e) => {
                             return Err(e);
@@ -184,7 +194,7 @@ pub struct Response {
     pub response_type: String,
     #[serde(default)]
     #[serde(skip_serializing_if = "String::is_empty")]
-    pub session_id: String,
+    pub trace_id: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub function_error: String,
 }
@@ -221,7 +231,7 @@ impl Response {
             hits: Vec::new(),
             aggs: HashMap::new(),
             response_type: "".to_string(),
-            session_id: "".to_string(),
+            trace_id: "".to_string(),
             function_error: "".to_string(),
         }
     }
@@ -272,8 +282,8 @@ impl Response {
         self.scan_records = val;
     }
 
-    pub fn set_session_id(&mut self, session_id: String) {
-        self.session_id = session_id;
+    pub fn set_trace_id(&mut self, trace_id: String) {
+        self.trace_id = trace_id;
     }
 }
 
@@ -288,12 +298,135 @@ pub struct SearchPartitionRequest {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, ToSchema)]
 pub struct SearchPartitionResponse {
-    pub session_id: String,
+    pub trace_id: String,
     pub file_num: usize,
     pub records: usize,
     pub original_size: usize,
     pub compressed_size: usize,
     pub partitions: Vec<[i64; 2]>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, ToSchema)]
+pub struct JobStatusResponse {
+    pub status: Vec<JobStatus>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, ToSchema)]
+pub struct JobStatus {
+    pub trace_id: String,
+    pub status: String,
+    pub created_at: i64,
+    pub started_at: i64,
+    pub user_id: Option<String>,
+    pub org_id: Option<String>,
+    pub stream_type: Option<String>,
+    pub query: Option<QueryInfo>,
+    pub scan_stats: Option<ScanStats>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, ToSchema)]
+pub struct QueryInfo {
+    pub sql: String,
+    pub start_time: i64,
+    pub end_time: i64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, ToSchema)]
+pub struct CancelJobResponse {
+    pub trace_id: String,
+    pub is_success: bool,
+}
+
+#[derive(Clone, Debug, Copy, Default, Serialize, Deserialize, ToSchema)]
+pub struct ScanStats {
+    pub files: i64,
+    pub records: i64,
+    pub original_size: i64,
+    pub compressed_size: i64,
+}
+
+impl ScanStats {
+    pub fn new() -> Self {
+        ScanStats::default()
+    }
+
+    pub fn add(&mut self, other: &ScanStats) {
+        self.files += other.files;
+        self.records += other.records;
+        self.original_size += other.original_size;
+        self.compressed_size += other.compressed_size;
+    }
+
+    pub fn format_to_mb(&mut self) {
+        self.original_size = self.original_size / 1024 / 1024;
+        self.compressed_size = self.compressed_size / 1024 / 1024;
+    }
+}
+
+impl From<Request> for cluster_rpc::SearchRequest {
+    fn from(req: Request) -> Self {
+        let req_query = cluster_rpc::SearchQuery {
+            sql: req.query.sql.clone(),
+            sql_mode: req.query.sql_mode.clone(),
+            quick_mode: req.query.quick_mode,
+            query_type: req.query.query_type.clone(),
+            from: req.query.from as i32,
+            size: req.query.size as i32,
+            start_time: req.query.start_time,
+            end_time: req.query.end_time,
+            sort_by: req.query.sort_by.unwrap_or_default(),
+            track_total_hits: req.query.track_total_hits,
+            query_context: req.query.query_context.unwrap_or_default(),
+            uses_zo_fn: req.query.uses_zo_fn,
+            query_fn: req.query.query_fn.unwrap_or_default(),
+        };
+
+        let job = cluster_rpc::Job {
+            trace_id: ider::uuid(),
+            job: "".to_string(),
+            stage: 0,
+            partition: 0,
+        };
+
+        let mut aggs = Vec::new();
+        for (name, sql) in req.aggs {
+            aggs.push(cluster_rpc::SearchAggRequest { name, sql });
+        }
+
+        cluster_rpc::SearchRequest {
+            job: Some(job),
+            org_id: "".to_string(),
+            stype: cluster_rpc::SearchType::User.into(),
+            query: Some(req_query),
+            aggs,
+            file_list: vec![],
+            stream_type: "".to_string(),
+            timeout: req.timeout,
+            work_group: "".to_string(),
+        }
+    }
+}
+
+impl From<&ScanStats> for cluster_rpc::ScanStats {
+    fn from(req: &ScanStats) -> Self {
+        cluster_rpc::ScanStats {
+            files: req.files,
+            records: req.records,
+            original_size: req.original_size,
+            compressed_size: req.compressed_size,
+        }
+    }
+}
+
+impl From<&cluster_rpc::ScanStats> for ScanStats {
+    fn from(req: &cluster_rpc::ScanStats) -> Self {
+        ScanStats {
+            files: req.files,
+            records: req.records,
+            original_size: req.original_size,
+            compressed_size: req.compressed_size,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -361,5 +494,36 @@ mod tests {
         req.decode().unwrap();
         assert_eq!(req.query.sql, "select * from test");
         assert_eq!(req.aggs.get("sql").unwrap(), "select * from olympics");
+    }
+
+    #[tokio::test]
+    async fn test_search_convert() {
+        let mut req = Request {
+            query: Query {
+                sql: "SELECT * FROM test".to_string(),
+                sql_mode: "default".to_string(),
+                quick_mode: false,
+                query_type: "".to_string(),
+                from: 0,
+                size: 100,
+                start_time: 0,
+                end_time: 0,
+                sort_by: None,
+                track_total_hits: false,
+                query_context: None,
+                uses_zo_fn: false,
+                query_fn: None,
+            },
+            aggs: HashMap::new(),
+            encoding: "base64".into(),
+            timeout: 0,
+        };
+        req.aggs
+            .insert("test".to_string(), "SELECT * FROM test".to_string());
+
+        let rpc_req = cluster_rpc::SearchRequest::from(req.clone());
+
+        assert_eq!(rpc_req.query.as_ref().unwrap().sql, req.query.sql);
+        assert_eq!(rpc_req.query.as_ref().unwrap().size, req.query.size as i32);
     }
 }

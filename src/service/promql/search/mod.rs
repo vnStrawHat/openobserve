@@ -1,4 +1,4 @@
-// Copyright 2023 Zinc Labs Inc.
+// Copyright 2024 Zinc Labs Inc.
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -21,6 +21,7 @@ use std::{
 use config::{
     ider,
     meta::{
+        search::ScanStats,
         stream::StreamType,
         usage::{RequestStats, UsageType},
     },
@@ -29,13 +30,13 @@ use config::{
 use futures::future::try_join_all;
 use hashbrown::HashMap;
 use infra::errors::{Error, ErrorCodes, Result};
+use proto::cluster_rpc;
 use tonic::{codec::CompressionEncoding, metadata::MetadataValue, transport::Channel, Request};
 use tracing::{info_span, Instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::{
-    common::{infra::cluster, meta::stream::ScanStats},
-    handler::grpc::cluster_rpc,
+    common::infra::cluster,
     service::{
         promql::{micros, value::*, MetricsQueryRequest, DEFAULT_LOOKBACK},
         search::{server_internal_error, MetadataMap},
@@ -103,10 +104,10 @@ async fn search_in_cluster(
 
     // partition request, here plus 1 second, because division is integer, maybe
     // lose some precision XXX-REFACTORME: move this into a function
-    let session_id = ider::uuid();
-    let job_id = session_id[0..6].to_string(); // take the last 6 characters as job id
+    let trace_id = ider::uuid();
+    let job_id = trace_id[0..6].to_string(); // take the last 6 characters as job id
     let job = cluster_rpc::Job {
-        session_id,
+        trace_id,
         job: job_id,
         stage: 0,
         partition: 0,
@@ -190,7 +191,9 @@ async fn search_in_cluster(
                 );
                 client = client
                     .send_compressed(CompressionEncoding::Gzip)
-                    .accept_compressed(CompressionEncoding::Gzip);
+                    .accept_compressed(CompressionEncoding::Gzip)
+                    .max_decoding_message_size(CONFIG.grpc.max_message_size * 1024 * 1024)
+                    .max_encoding_message_size(CONFIG.grpc.max_message_size * 1024 * 1024);
                 let response: cluster_rpc::MetricsQueryResponse = match client.query(request).await
                 {
                     Ok(res) => res.into_inner(),

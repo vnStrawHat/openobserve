@@ -142,6 +142,46 @@ Error tracking
 
 ![Ingestion](./screenshots/ingestion2.png)
 
+### SBOM
+
+Software Bill of Materials for OpenObserve
+
+#### Rust
+
+SBOM can be found [here](./openobserve.cdx.xml). You can analyze it using [dependency track](https://dependencytrack.org/).
+
+In order to generate the SBOM, you can use the following commands:
+
+Install cargo-cyclonedx:
+
+````bash
+cargo install cargo-cyclonedx
+````
+
+Generate the SBOM:
+```bash
+cargo-cyclonedx cyclonedx
+```
+
+#### JavaScript
+
+SBOM can be found [here](./web/sbom.json ). You can analyze it using [dependency track](https://dependencytrack.org/).
+
+In order to generate the SBOM, you can use the following commands:
+
+Install cyclonedx-npm:
+
+````bash
+npm install -g cyclonedx-npm
+````
+
+Generate the SBOM:
+```bash
+cd web
+cyclonedx-npm > sbom.json         
+```
+
+
 ## ⚖️ License
 
 OpenObserve is licensed under the AGPL-3.0 license. For more details, see the [LICENSE](https://github.com/openobserve/openobserve/blob/main/LICENSE).
