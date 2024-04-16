@@ -341,7 +341,7 @@ export default defineComponent({
 
         resultTotal.value = res.data.data.length;
         let counter = 1;
-        console.log(store.state.currentuser.id)
+        console.log(store.state.currentuser)
         organizations.value = res.data.data.map((data: any) => {
           const memberrole = data.OrganizationMemberObj.filter(
             (v: any) =>
