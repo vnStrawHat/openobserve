@@ -184,24 +184,25 @@ export default defineComponent({
         userInfo: this.userInfo,
       });
 
-      //analytics
-      const userId = this.userInfo.email;
-      segment.identify(
-        "Log In",
-        {
-          email: userId,
-          name: this.userInfo.given_name + " " + this.userInfo.family_name,
-          firstName: this.userInfo.given_name,
-          lastName: this.userInfo.family_name,
-        },
-        { originalTimestamp: moment.utc().format() }
-      );
+      // //analytics
+      // const userId = this.userInfo.email;
+      // segment.identify(
+      //   "Log In",
+      //   {
+      //     email: userId,
+      //     name: this.userInfo.given_name + " " + this.userInfo.family_name,
+      //     firstName: this.userInfo.given_name,
+      //     lastName: this.userInfo.family_name,
+      //   },
+      //   { originalTimestamp: moment.utc().format() }
+      // );
 
-      openobserveRum.setUser({
-        name: this.userInfo.given_name + " " + this.userInfo.family_name,
-        email: this.userInfo.email,
-      });
-      this.getDefaultOrganization();
+      // openobserveRum.setUser({
+      //   name: this.userInfo.given_name + " " + this.userInfo.family_name,
+      //   email: this.userInfo.email,
+      // });
+      // this.getDefaultOrganization();
+      this.VerifyAndCreateUser();
     }
   },
   methods: {
