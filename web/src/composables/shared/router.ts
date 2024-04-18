@@ -224,8 +224,8 @@ const useRoutes = () => {
       ],
     },
     {
-      path: "functions",
-      name: "functions",
+      path: "pipeline",
+      name: "pipeline",
       component: Functions,
       beforeEnter(to: any, from: any, next: any) {
         routeGuard(to, from, next);

@@ -92,8 +92,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
             class="warning-msg"
             style="display: inline"
           >
-            <q-icon name="warning"
-size="xs" class="warning" />{{
+            <q-icon name="warning" size="xs" class="warning" />{{
               store.state.organizationData.quotaThresholdMsg
             }}
           </div>
@@ -183,8 +182,7 @@ size="xs" class="warning" />{{
           <q-btn-dropdown flat unelevated no-caps padding="xs sm">
             <template #label>
               <div class="row items-center no-wrap">
-                <q-avatar size="md"
-color="grey" text-color="white">
+                <q-avatar size="md" color="grey" text-color="white">
                   <img
                     :src="
                       user.picture
@@ -417,7 +415,7 @@ export default defineComponent({
       useLocalCurrentUser("", true);
       useLocalUserInfo("", true);
 
-      if(config.isCloud == "true") {
+      if (config.isCloud == "true") {
         window.location.href = logoutURL;
       }
       this.$router.push("/logout");
@@ -447,7 +445,7 @@ export default defineComponent({
       : undefined;
     const selectedOrg = ref(store.state.selectedOrganization);
     const excludeParentRedirect = [
-      "functions",
+      "pipeline",
       "functionList",
       "streamFunctions",
       "enrichmentTables",
@@ -1004,7 +1002,7 @@ export default defineComponent({
       }, 500);
     },
     changeUserInfo(newVal) {
-      if(JSON.stringify(newVal) != "{}") {
+      if (JSON.stringify(newVal) != "{}") {
         this.triggerRefreshToken();
       }
     },

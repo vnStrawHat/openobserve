@@ -134,7 +134,8 @@
     "rum": "Real User Monitoring",
     "settings": "Settings",
     "iam": "IAM",
-    "report": "Reports"
+    "report": "Reports",
+    "pipeline": "Pipeline"
   },
   "rum": {
     "title": "Real User Monitoring",
@@ -373,6 +374,9 @@
     "createStream": "Create Stream",
     "indexType": "Index Type"
   },
+  "pipeline": {
+    "header": "Pipeline"
+  },
   "function": {
     "header": "Functions",
     "add": "Create new function",
@@ -406,7 +410,8 @@
     "uploadCSVFile": "Upload CSV File",
     "selectFunction": "Select Function",
     "appendData": "Append data to existing Enrichment Table",
-    "deleteAssociatedFunction": "Delete Associated Function"
+    "deleteAssociatedFunction": "Delete Associated Function",
+    "streamPipeline": "Stream Pipelines"
   },
   "confirmDialog": {
     "cancel": "Cancel",
