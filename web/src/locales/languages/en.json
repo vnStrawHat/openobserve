@@ -375,7 +375,8 @@
     "indexType": "Index Type"
   },
   "pipeline": {
-    "header": "Pipeline"
+    "header": "Pipeline",
+    "create": "Create Pipeline"
   },
   "function": {
     "header": "Functions",
