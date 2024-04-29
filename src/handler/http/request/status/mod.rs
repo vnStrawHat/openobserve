@@ -1,4 +1,4 @@
-// Copyright 2023 Zinc Labs Inc.
+// Copyright 2024 Zinc Labs Inc.
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -15,22 +15,35 @@
 
 use std::io::Error;
 
-use actix_web::{cookie, get, http::header, put, web, HttpRequest, HttpResponse};
+use actix_web::{
+    cookie,
+    cookie::{Cookie, SameSite},
+    get,
+    http::header,
+    put, web, HttpRequest, HttpResponse,
+};
 use config::{
     cluster::{is_ingester, LOCAL_NODE_ROLE, LOCAL_NODE_UUID},
     meta::cluster::NodeStatus,
     utils::{json, schema_ext::SchemaExt},
-    CONFIG, HAS_FUNCTIONS, INSTANCE_ID, QUICK_MODEL_FIELDS, SQL_FULL_TEXT_SEARCH_FIELDS,
+    CONFIG, INSTANCE_ID, QUICK_MODEL_FIELDS, SQL_FULL_TEXT_SEARCH_FIELDS,
 };
 use datafusion::arrow::datatypes::Schema;
 use hashbrown::HashMap;
-use infra::{cache, file_list};
+use infra::{
+    cache, file_list,
+    schema::{STREAM_SCHEMAS, STREAM_SCHEMAS_FIELDS, STREAM_SCHEMAS_LATEST},
+};
 use serde::Serialize;
 use utoipa::ToSchema;
 #[cfg(feature = "enterprise")]
 use {
     crate::common::utils::jwt::verify_decode_token,
-    crate::handler::http::auth::{jwt::process_token, validator::PKCE_STATE_ORG},
+    crate::handler::http::auth::{
+        jwt::process_token,
+        validator::{ID_TOKEN_HEADER, PKCE_STATE_ORG},
+    },
+    config::{ider, utils::base64},
     o2_enterprise::enterprise::{
         common::{
             infra::config::O2_CONFIG,
@@ -44,7 +57,7 @@ use {
 use crate::{
     common::{
         infra::{cluster, config::*},
-        meta::{functions::ZoFunction, http::HttpResponse as MetaHttpResponse},
+        meta::{functions::ZoFunction, http::HttpResponse as MetaHttpResponse, user::AuthTokens},
     },
     service::{db, search::datafusion::DEFAULT_FUNCTIONS},
 };
@@ -60,7 +73,6 @@ struct ConfigResponse<'a> {
     instance: String,
     commit_hash: String,
     build_date: String,
-    functions_enabled: bool,
     default_fts_keys: Vec<String>,
     default_quick_mode_fields: Vec<String>,
     telemetry_enabled: bool,
@@ -187,7 +199,6 @@ pub async fn zo_config() -> Result<HttpResponse, Error> {
         instance: INSTANCE_ID.get("instance_id").unwrap().to_string(),
         commit_hash: COMMIT_HASH.to_string(),
         build_date: BUILD_DATE.to_string(),
-        functions_enabled: HAS_FUNCTIONS,
         telemetry_enabled: CONFIG.common.telemetry_enabled,
         default_fts_keys: SQL_FULL_TEXT_SEARCH_FIELDS
             .iter()
@@ -305,6 +316,8 @@ async fn get_stream_schema_status() -> (usize, usize, usize) {
 #[cfg(feature = "enterprise")]
 #[get("/redirect")]
 pub async fn redirect(req: HttpRequest) -> Result<HttpResponse, Error> {
+    use crate::common::meta::user::AuthTokens;
+
     let query = web::Query::<HashMap<String, String>>::from_query(req.query_string()).unwrap();
     let code = match query.get("code") {
         Some(code) => code,
@@ -328,51 +341,68 @@ pub async fn redirect(req: HttpRequest) -> Result<HttpResponse, Error> {
         }
     };
 
+    log::info!("entering exchange_code: {}", code);
+
     match exchange_code(code).await {
         Ok(login_data) => {
-            let token = login_data.access_token;
+            let login_url;
+            let access_token = login_data.access_token;
             let keys = get_jwks().await;
             let token_ver =
-                verify_decode_token(&token, &keys, &O2_CONFIG.dex.client_id, true).await;
-
+                verify_decode_token(&access_token, &keys, &O2_CONFIG.dex.client_id, true).await;
+            let id_token;
             match token_ver {
-                Ok(res) => process_token(res).await,
+                Ok(res) => {
+                    id_token = json::to_string(&json::json!({
+                        "email": res.0.user_email,
+                        "name": res.0.user_name,
+                        "family_name": res.0.family_name,
+                        "given_name": res.0.given_name,
+                        "is_valid": res.0.is_valid,
+                    }))
+                    .unwrap();
+                    login_url = format!(
+                        "{}#id_token={}.{}",
+                        login_data.url,
+                        ID_TOKEN_HEADER,
+                        base64::encode(&id_token)
+                    );
+                    process_token(res).await
+                }
                 Err(e) => return Ok(HttpResponse::Unauthorized().json(e.to_string())),
             }
 
-            let mut access_token_cookie = cookie::Cookie::new("access_token", token);
-            access_token_cookie.set_expires(
+            // generate new UUID for access token & store token in DB
+            let session_id = ider::uuid();
+
+            // store session_id in cluster co-ordinator
+            let _ = crate::service::session::set_session(&session_id, &access_token).await;
+
+            let access_token = format!("session {}", session_id);
+
+            let tokens = json::to_string(&AuthTokens {
+                access_token,
+                refresh_token: login_data.refresh_token,
+            })
+            .unwrap();
+
+            let mut auth_cookie = Cookie::new("auth_tokens", tokens);
+            auth_cookie.set_expires(
                 cookie::time::OffsetDateTime::now_utc()
                     + cookie::time::Duration::seconds(CONFIG.auth.cookie_max_age),
             );
-            access_token_cookie.set_http_only(true);
-            access_token_cookie.set_secure(CONFIG.auth.cookie_secure_only);
-            access_token_cookie.set_path("/");
+            auth_cookie.set_http_only(true);
+            auth_cookie.set_secure(CONFIG.auth.cookie_secure_only);
+            auth_cookie.set_path("/");
             if CONFIG.auth.cookie_same_site_lax {
-                access_token_cookie.set_same_site(cookie::SameSite::Lax)
+                auth_cookie.set_same_site(SameSite::Lax);
             } else {
-                access_token_cookie.set_same_site(cookie::SameSite::None)
-            };
-
-            let mut refresh_token_cookie =
-                cookie::Cookie::new("refresh_token", login_data.refresh_token);
-            refresh_token_cookie.set_expires(
-                cookie::time::OffsetDateTime::now_utc()
-                    + cookie::time::Duration::seconds(CONFIG.auth.cookie_max_age),
-            );
-            refresh_token_cookie.set_http_only(true);
-            refresh_token_cookie.set_secure(CONFIG.auth.cookie_secure_only);
-            refresh_token_cookie.set_path("/");
-            if CONFIG.auth.cookie_same_site_lax {
-                refresh_token_cookie.set_same_site(cookie::SameSite::Lax)
-            } else {
-                refresh_token_cookie.set_same_site(cookie::SameSite::None)
-            };
-
+                auth_cookie.set_same_site(SameSite::None);
+            }
+            log::info!("Redirecting user after processing token");
             Ok(HttpResponse::Found()
-                .append_header((header::LOCATION, login_data.url))
-                .cookie(access_token_cookie)
-                .cookie(refresh_token_cookie)
+                .append_header((header::LOCATION, login_url))
+                .cookie(auth_cookie)
                 .finish())
         }
         Err(e) => Ok(HttpResponse::Unauthorized().json(e.to_string())),
@@ -394,65 +424,110 @@ pub async fn dex_login() -> Result<HttpResponse, Error> {
 #[cfg(feature = "enterprise")]
 #[get("/dex_refresh")]
 async fn refresh_token_with_dex(req: actix_web::HttpRequest) -> HttpResponse {
-    let token = if req.headers().contains_key(header::AUTHORIZATION) {
-        req.headers()
-            .get(header::AUTHORIZATION)
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_string()
+    let token = if let Some(cookie) = req.cookie("auth_tokens") {
+        let auth_tokens: AuthTokens = json::from_str(cookie.value()).unwrap_or_default();
+
+        // remove old session id from cluster co-ordinator
+
+        let access_token = auth_tokens.access_token;
+        if access_token.starts_with("session") {
+            crate::service::session::remove_session(access_token.strip_prefix("session ").unwrap())
+                .await;
+        }
+
+        auth_tokens.refresh_token
     } else {
         return HttpResponse::Unauthorized().finish();
     };
 
     // Exchange the refresh token for a new access token
     match refresh_token(&token).await {
-        Ok(token_response) => HttpResponse::Ok().json(token_response),
-        Err(_) => {
-            let mut access_cookie = cookie::Cookie::new("access_token", "");
-            access_cookie.set_http_only(true);
-            access_cookie.set_secure(CONFIG.auth.cookie_secure_only);
-            access_cookie.set_path("/");
+        Ok((access_token, refresh_token)) => {
+            // generate new UUID for access token & store token in DB
+            let session_id = ider::uuid();
 
+            // store session_id in cluster co-ordinator
+            let _ = crate::service::session::set_session(&session_id, &access_token).await;
+
+            let access_token = format!("session {}", session_id);
+
+            let tokens = json::to_string(&AuthTokens {
+                access_token,
+                refresh_token,
+            })
+            .unwrap();
+
+            let mut auth_cookie = Cookie::new("auth_tokens", tokens);
+            auth_cookie.set_expires(
+                cookie::time::OffsetDateTime::now_utc()
+                    + cookie::time::Duration::seconds(CONFIG.auth.cookie_max_age),
+            );
+            auth_cookie.set_http_only(true);
+            auth_cookie.set_secure(CONFIG.auth.cookie_secure_only);
+            auth_cookie.set_path("/");
             if CONFIG.auth.cookie_same_site_lax {
-                access_cookie.set_same_site(cookie::SameSite::Lax)
+                auth_cookie.set_same_site(SameSite::Lax);
             } else {
-                access_cookie.set_same_site(cookie::SameSite::None)
-            };
-            let mut refresh_cookie = cookie::Cookie::new("refresh_token", "");
-            refresh_cookie.set_http_only(true);
-            refresh_cookie.set_secure(CONFIG.auth.cookie_secure_only);
-            refresh_cookie.set_path("/");
+                auth_cookie.set_same_site(SameSite::None);
+            }
+
+            HttpResponse::Ok().cookie(auth_cookie).finish()
+        }
+        Err(_) => {
+            let tokens = json::to_string(&AuthTokens::default()).unwrap();
+            let mut auth_cookie = Cookie::new("auth_tokens", tokens);
+            auth_cookie.set_expires(
+                cookie::time::OffsetDateTime::now_utc()
+                    + cookie::time::Duration::seconds(CONFIG.auth.cookie_max_age),
+            );
+            auth_cookie.set_http_only(true);
+            auth_cookie.set_secure(CONFIG.auth.cookie_secure_only);
+            auth_cookie.set_path("/");
             if CONFIG.auth.cookie_same_site_lax {
-                refresh_cookie.set_same_site(cookie::SameSite::Lax)
+                auth_cookie.set_same_site(SameSite::Lax);
             } else {
-                refresh_cookie.set_same_site(cookie::SameSite::None)
-            };
+                auth_cookie.set_same_site(SameSite::None);
+            }
+
             HttpResponse::Unauthorized()
                 .append_header((header::LOCATION, "/"))
-                .cookie(access_cookie)
-                .cookie(refresh_cookie)
+                .cookie(auth_cookie)
                 .finish()
         }
     }
 }
 
 #[get("/logout")]
-async fn logout(_req: actix_web::HttpRequest) -> HttpResponse {
-    let mut access_cookie = cookie::Cookie::new("access_token", "");
-    access_cookie.set_http_only(true);
-    access_cookie.set_secure(CONFIG.auth.cookie_secure_only);
-    access_cookie.set_path("/");
-    access_cookie.set_same_site(cookie::SameSite::Lax);
-    let mut refresh_cookie = cookie::Cookie::new("refresh_token", "");
-    refresh_cookie.set_http_only(true);
-    refresh_cookie.set_secure(CONFIG.auth.cookie_secure_only);
-    refresh_cookie.set_path("/");
-    refresh_cookie.set_same_site(cookie::SameSite::Lax);
+async fn logout(req: actix_web::HttpRequest) -> HttpResponse {
+    // remove the session
+
+    if let Some(cookie) = req.cookie("auth_tokens") {
+        let auth_tokens: AuthTokens = json::from_str(cookie.value()).unwrap_or_default();
+        let access_token = auth_tokens.access_token;
+        if access_token.starts_with("session") {
+            crate::service::session::remove_session(access_token.strip_prefix("session ").unwrap())
+                .await;
+        }
+    };
+
+    let tokens = json::to_string(&AuthTokens::default()).unwrap();
+    let mut auth_cookie = Cookie::new("auth_tokens", tokens);
+    auth_cookie.set_expires(
+        cookie::time::OffsetDateTime::now_utc()
+            + cookie::time::Duration::seconds(CONFIG.auth.cookie_max_age),
+    );
+    auth_cookie.set_http_only(true);
+    auth_cookie.set_secure(CONFIG.auth.cookie_secure_only);
+    auth_cookie.set_path("/");
+    if CONFIG.auth.cookie_same_site_lax {
+        auth_cookie.set_same_site(SameSite::Lax);
+    } else {
+        auth_cookie.set_same_site(SameSite::None);
+    }
+
     HttpResponse::Ok()
         .append_header((header::LOCATION, "/"))
-        .cookie(access_cookie)
-        .cookie(refresh_cookie)
+        .cookie(auth_cookie)
         .finish()
 }
 

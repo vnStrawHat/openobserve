@@ -1,4 +1,4 @@
-// Copyright 2023 Zinc Labs Inc.
+// Copyright 2024 Zinc Labs Inc.
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -20,11 +20,16 @@ use bytes::BytesMut;
 use chrono::Utc;
 use config::{
     cluster,
-    meta::{stream::StreamType, usage::UsageType},
+    meta::{
+        stream::{PartitioningDetails, StreamType},
+        usage::UsageType,
+    },
     metrics,
     utils::{flatten, json, schema_ext::SchemaExt},
     CONFIG,
 };
+use hashbrown::HashSet;
+use infra::schema::unwrap_partition_time_level;
 use opentelemetry::trace::{SpanId, TraceId};
 use opentelemetry_proto::tonic::{
     collector::metrics::v1::{ExportMetricsServiceRequest, ExportMetricsServiceResponse},
@@ -37,7 +42,7 @@ use crate::{
         alerts,
         http::HttpResponse as MetaHttpResponse,
         prom::*,
-        stream::{PartitioningDetails, SchemaRecords},
+        stream::{SchemaRecords, StreamParams},
     },
     service::{
         db, format_stream_name,
@@ -48,7 +53,6 @@ use crate::{
         },
         metrics::{format_label_name, get_exclude_labels},
         schema::{check_for_schema, set_schema_metadata, stream_schema_exists, SchemaCache},
-        stream::unwrap_partition_time_level,
         usage::report_request_usage_stats,
     },
 };
@@ -127,9 +131,11 @@ pub async fn handle_grpc_request(
 
                 // Start get stream alerts
                 crate::service::ingestion::get_stream_alerts(
-                    org_id,
-                    &StreamType::Metrics,
-                    metric_name,
+                    &[StreamParams {
+                        org_id: org_id.to_owned().into(),
+                        stream_name: metric_name.to_owned().into(),
+                        stream_type: StreamType::Metrics,
+                    }],
                     &mut stream_alerts_map,
                 )
                 .await;
@@ -137,7 +143,7 @@ pub async fn handle_grpc_request(
 
                 // Start Register Transforms for stream
                 let (mut local_trans, mut stream_vrl_map) =
-                    crate::service::ingestion::register_stream_transforms(
+                    crate::service::ingestion::register_stream_functions(
                         org_id,
                         &StreamType::Metrics,
                         metric_name,
@@ -248,9 +254,11 @@ pub async fn handle_grpc_request(
 
                         // Start get stream alerts
                         crate::service::ingestion::get_stream_alerts(
-                            org_id,
-                            &StreamType::Metrics,
-                            local_metric_name,
+                            &[StreamParams {
+                                org_id: org_id.to_owned().into(),
+                                stream_name: local_metric_name.to_owned().into(),
+                                stream_type: StreamType::Metrics,
+                            }],
                             &mut stream_alerts_map,
                         )
                         .await;
@@ -258,7 +266,7 @@ pub async fn handle_grpc_request(
 
                         // Start Register Transforms for stream
                         (local_trans, stream_vrl_map) =
-                            crate::service::ingestion::register_stream_transforms(
+                            crate::service::ingestion::register_stream_functions(
                                 org_id,
                                 &StreamType::Metrics,
                                 local_metric_name,
@@ -267,7 +275,7 @@ pub async fn handle_grpc_request(
                     }
 
                     if !local_trans.is_empty() {
-                        rec = crate::service::ingestion::apply_stream_transform(
+                        rec = crate::service::ingestion::apply_stream_functions(
                             &local_trans,
                             rec,
                             &stream_vrl_map,
@@ -289,7 +297,24 @@ pub async fn handle_grpc_request(
                     let value_str = json::to_string(&val_map).unwrap();
 
                     // check for schema evolution
-                    if !schema_evolved.contains_key(local_metric_name)
+                    let schema_fields = match metric_schema_map.get(local_metric_name) {
+                        Some(schema) => schema
+                            .schema()
+                            .fields()
+                            .iter()
+                            .map(|f| f.name())
+                            .collect::<HashSet<_>>(),
+                        None => HashSet::default(),
+                    };
+                    let mut need_schema_check = !schema_evolved.contains_key(local_metric_name);
+                    for key in val_map.keys() {
+                        if !schema_fields.contains(&key) {
+                            need_schema_check = true;
+                            break;
+                        }
+                    }
+                    drop(schema_fields);
+                    if need_schema_check
                         && check_for_schema(
                             org_id,
                             local_metric_name,

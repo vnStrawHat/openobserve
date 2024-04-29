@@ -39,12 +39,9 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::{
     common::infra::cluster::{get_cached_online_ingester_nodes, get_internal_grpc_token},
-    service::{
-        db,
-        search::{
-            datafusion::exec::{prepare_datafusion_context, register_table},
-            MetadataMap,
-        },
+    service::search::{
+        datafusion::exec::{prepare_datafusion_context, register_table},
+        MetadataMap,
     },
 };
 
@@ -122,7 +119,7 @@ pub(crate) async fn create_context(
 
     // fetch all schema versions, get latest schema
     let stream_type = StreamType::Metrics;
-    let schema = db::schema::get(org_id, stream_name, stream_type)
+    let schema = infra::schema::get(org_id, stream_name, stream_type)
         .await
         .map_err(|err| {
             log::error!("get schema error: {}", err);
@@ -131,7 +128,7 @@ pub(crate) async fn create_context(
     for (_, (mut arrow_schema, record_batches)) in record_batches_meta {
         if !record_batches.is_empty() {
             let ctx = prepare_datafusion_context(None, &SearchType::Normal, false)?;
-            // calulate schema diff
+            // calculate schema diff
             let mut diff_fields = HashMap::new();
             let group_fields = arrow_schema.fields();
             for field in group_fields {
@@ -141,7 +138,7 @@ pub(crate) async fn create_context(
                     }
                 }
             }
-            // add not exists field for wal infered schema
+            // add not exists field for wal inferred schema
             let mut new_fields = Vec::new();
             for field in schema.fields() {
                 if arrow_schema.field_with_name(field.name()).is_err() {

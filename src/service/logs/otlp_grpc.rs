@@ -102,9 +102,11 @@ pub async fn usage_ingest(
 
     // Start get stream alerts
     crate::service::ingestion::get_stream_alerts(
-        org_id,
-        &StreamType::Logs,
-        stream_name,
+        &[StreamParams {
+            org_id: org_id.to_owned().into(),
+            stream_name: stream_name.to_owned().into(),
+            stream_type: StreamType::Logs,
+        }],
         &mut stream_alerts_map,
     )
     .await;
@@ -114,7 +116,7 @@ pub async fn usage_ingest(
     let reader: Vec<json::Value> = json::from_slice(&body)?;
     for item in reader.into_iter() {
         // JSON Flattening
-        let mut value = flatten::flatten(item)?;
+        let mut value = flatten::flatten_with_level(item, CONFIG.limit.ingest_flatten_level)?;
 
         // get json object
         let mut local_val = match value.take() {
@@ -309,16 +311,18 @@ pub async fn handle_grpc_request(
 
     // Start get stream alerts
     crate::service::ingestion::get_stream_alerts(
-        org_id,
-        &StreamType::Logs,
-        stream_name,
+        &[StreamParams {
+            org_id: org_id.to_owned().into(),
+            stream_name: stream_name.to_owned().into(),
+            stream_type: StreamType::Logs,
+        }],
         &mut stream_alerts_map,
     )
     .await;
     // End get stream alert
 
     // Start Register Transforms for stream
-    let (local_trans, stream_vrl_map) = crate::service::ingestion::register_stream_transforms(
+    let (local_trans, stream_vrl_map) = crate::service::ingestion::register_stream_functions(
         org_id,
         &StreamType::Logs,
         stream_name,
@@ -412,10 +416,10 @@ pub async fn handle_grpc_request(
                 };
 
                 // flattening
-                rec = flatten::flatten(rec)?;
+                rec = flatten::flatten_with_level(rec, CONFIG.limit.ingest_flatten_level)?;
 
                 if !local_trans.is_empty() {
-                    rec = crate::service::ingestion::apply_stream_transform(
+                    rec = crate::service::ingestion::apply_stream_functions(
                         &local_trans,
                         rec,
                         &stream_vrl_map,

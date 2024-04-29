@@ -1,4 +1,4 @@
-// Copyright 2023 Zinc Labs Inc.
+// Copyright 2024 Zinc Labs Inc.
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -20,6 +20,7 @@ pub mod errors;
 pub mod file_list;
 pub mod queue;
 pub mod scheduler;
+pub mod schema;
 pub mod storage;
 
 pub async fn init() -> Result<(), anyhow::Error> {
@@ -28,6 +29,7 @@ pub async fn init() -> Result<(), anyhow::Error> {
     cache::init().await?;
     file_list::create_table().await?;
     queue::init().await?;
+    scheduler::init().await?;
     // because of asynchronous, we need to wait for a while
     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
     Ok(())

@@ -1,4 +1,4 @@
-// Copyright 2023 Zinc Labs Inc.
+// Copyright 2024 Zinc Labs Inc.
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -21,13 +21,14 @@ use chrono::{Duration, Utc};
 use config::{
     cluster,
     meta::{
-        stream::{PartitionTimeLevel, StreamType},
+        stream::{PartitionTimeLevel, StreamPartition, StreamType},
         usage::UsageType,
     },
     metrics,
     utils::{flatten, json, schema_ext::SchemaExt},
     CONFIG, DISTINCT_FIELDS,
 };
+use infra::schema::unwrap_partition_time_level;
 use opentelemetry::trace::{SpanId, TraceId};
 use opentelemetry_proto::tonic::{
     collector::trace::v1::{
@@ -41,7 +42,7 @@ use crate::{
     common::meta::{
         alerts::Alert,
         http::HttpResponse as MetaHttpResponse,
-        stream::{SchemaRecords, StreamPartition},
+        stream::{SchemaRecords, StreamParams},
         traces::{Event, Span, SpanRefType},
     },
     service::{
@@ -52,7 +53,6 @@ use crate::{
             MetadataType,
         },
         schema::{check_for_schema, stream_schema_exists, SchemaCache},
-        stream::unwrap_partition_time_level,
         usage::report_request_usage_stats,
     },
 };
@@ -64,6 +64,7 @@ const PARENT_TRACE_ID: &str = "reference.parent_trace_id";
 const REF_TYPE: &str = "reference.ref_type";
 const SERVICE_NAME: &str = "service.name";
 const SERVICE: &str = "service";
+const BLOCK_FIELDS: [&str; 4] = ["_timestamp", "duration", "start_time", "end_time"];
 
 pub async fn handle_trace_request(
     org_id: &str,
@@ -138,16 +139,18 @@ pub async fn handle_trace_request(
 
     // Start get stream alerts
     crate::service::ingestion::get_stream_alerts(
-        org_id,
-        &StreamType::Traces,
-        &traces_stream_name,
+        &[StreamParams {
+            org_id: org_id.to_owned().into(),
+            stream_name: traces_stream_name.to_owned().into(),
+            stream_type: StreamType::Traces,
+        }],
         &mut stream_alerts_map,
     )
     .await;
     // End get stream alert
 
     // Start Register Transforms for stream
-    let (local_trans, stream_vrl_map) = crate::service::ingestion::register_stream_transforms(
+    let (local_trans, stream_vrl_map) = crate::service::ingestion::register_stream_functions(
         org_id,
         &StreamType::Traces,
         &traces_stream_name,
@@ -217,7 +220,11 @@ pub async fn handle_trace_request(
                 let end_time: u64 = span.end_time_unix_nano;
                 let mut span_att_map: HashMap<String, json::Value> = HashMap::new();
                 for span_att in span.attributes {
-                    span_att_map.insert(span_att.key, get_val(&span_att.value.as_ref()));
+                    let mut key = span_att.key;
+                    if BLOCK_FIELDS.contains(&key.as_str()) {
+                        key = format!("attr_{}", key);
+                    }
+                    span_att_map.insert(key, get_val(&span_att.value.as_ref()));
                 }
 
                 let mut events = vec![];
@@ -261,7 +268,7 @@ pub async fn handle_trace_request(
                 })?;
 
                 if !local_trans.is_empty() {
-                    value = crate::service::ingestion::apply_stream_transform(
+                    value = crate::service::ingestion::apply_stream_functions(
                         &local_trans,
                         value,
                         &stream_vrl_map,

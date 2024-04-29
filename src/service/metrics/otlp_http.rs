@@ -1,4 +1,4 @@
-// Copyright 2023 Zinc Labs Inc.
+// Copyright 2024 Zinc Labs Inc.
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -20,11 +20,16 @@ use bytes::BytesMut;
 use chrono::Utc;
 use config::{
     cluster,
-    meta::{stream::StreamType, usage::UsageType},
+    meta::{
+        stream::{PartitioningDetails, StreamType},
+        usage::UsageType,
+    },
     metrics,
     utils::{flatten, json, schema_ext::SchemaExt},
     CONFIG,
 };
+use hashbrown::HashSet;
+use infra::schema::unwrap_partition_time_level;
 use opentelemetry::trace::{SpanId, TraceId};
 use opentelemetry_proto::tonic::{
     collector::metrics::v1::{ExportMetricsServiceRequest, ExportMetricsServiceResponse},
@@ -38,18 +43,14 @@ use crate::{
         alerts::Alert,
         http::HttpResponse as MetaHttpResponse,
         prom::{self, MetricType, HASH_LABEL, NAME_LABEL, VALUE_LABEL},
-        stream::{PartitioningDetails, SchemaRecords},
+        stream::{SchemaRecords, StreamParams},
     },
     handler::http::request::CONTENT_TYPE_JSON,
     service::{
         db, format_stream_name,
-        ingestion::{
-            evaluate_trigger, get_float_value, get_int_value, get_string_value, get_val_for_attr,
-            write_file, TriggerAlertData,
-        },
+        ingestion::{evaluate_trigger, get_val_for_attr, write_file, TriggerAlertData},
         metrics::{format_label_name, get_exclude_labels, otlp_grpc::handle_grpc_request},
         schema::{check_for_schema, set_schema_metadata, stream_schema_exists, SchemaCache},
-        stream::unwrap_partition_time_level,
         usage::report_request_usage_stats,
     },
 };
@@ -206,9 +207,11 @@ pub async fn metrics_json_handler(
 
                     // Start get stream alerts
                     crate::service::ingestion::get_stream_alerts(
-                        org_id,
-                        &StreamType::Metrics,
-                        metric_name,
+                        &[StreamParams {
+                            org_id: org_id.to_owned().into(),
+                            stream_name: metric_name.to_owned().into(),
+                            stream_type: StreamType::Metrics,
+                        }],
                         &mut stream_alerts_map,
                     )
                     .await;
@@ -216,7 +219,7 @@ pub async fn metrics_json_handler(
 
                     // Start Register Transforms for stream
                     let (mut local_trans, mut stream_vrl_map) =
-                        crate::service::ingestion::register_stream_transforms(
+                        crate::service::ingestion::register_stream_functions(
                             org_id,
                             &StreamType::Metrics,
                             metric_name,
@@ -346,9 +349,11 @@ pub async fn metrics_json_handler(
 
                             // Start get stream alerts
                             crate::service::ingestion::get_stream_alerts(
-                                org_id,
-                                &StreamType::Metrics,
-                                local_metric_name,
+                                &[StreamParams {
+                                    org_id: org_id.to_owned().into(),
+                                    stream_name: local_metric_name.to_owned().into(),
+                                    stream_type: StreamType::Metrics,
+                                }],
                                 &mut stream_alerts_map,
                             )
                             .await;
@@ -356,7 +361,7 @@ pub async fn metrics_json_handler(
 
                             // Start Register Transforms for stream
                             (local_trans, stream_vrl_map) =
-                                crate::service::ingestion::register_stream_transforms(
+                                crate::service::ingestion::register_stream_functions(
                                     org_id,
                                     &StreamType::Metrics,
                                     local_metric_name,
@@ -365,7 +370,7 @@ pub async fn metrics_json_handler(
                         }
 
                         if !local_trans.is_empty() {
-                            rec = crate::service::ingestion::apply_stream_transform(
+                            rec = crate::service::ingestion::apply_stream_functions(
                                 &local_trans,
                                 rec,
                                 &stream_vrl_map,
@@ -387,7 +392,24 @@ pub async fn metrics_json_handler(
                         let value_str = json::to_string(&val_map).unwrap();
 
                         // check for schema evolution
-                        if !schema_evolved.contains_key(local_metric_name)
+                        let schema_fields = match metric_schema_map.get(local_metric_name) {
+                            Some(schema) => schema
+                                .schema()
+                                .fields()
+                                .iter()
+                                .map(|f| f.name())
+                                .collect::<HashSet<_>>(),
+                            None => HashSet::default(),
+                        };
+                        let mut need_schema_check = !schema_evolved.contains_key(local_metric_name);
+                        for key in val_map.keys() {
+                            if !schema_fields.contains(&key) {
+                                need_schema_check = true;
+                                break;
+                            }
+                        }
+                        drop(schema_fields);
+                        if need_schema_check
                             && check_for_schema(
                                 org_id,
                                 local_metric_name,
@@ -740,9 +762,10 @@ fn process_data_point(rec: &mut json::Value, data_point: &json::Map<String, json
             rec[format_label_name(attr.get("key").unwrap().as_str().unwrap())] = get_val_for_attr(v)
         }
     }
-    let ts = get_int_value(data_point.get("timeUnixNano").unwrap());
+    let ts = json::get_int_value(data_point.get("timeUnixNano").unwrap());
     if data_point.get("startTimeUnixNano").is_some() {
-        rec["start_time"] = get_string_value(data_point.get("startTimeUnixNano").unwrap()).into();
+        rec["start_time"] =
+            json::get_string_value(data_point.get("startTimeUnixNano").unwrap()).into();
     }
     rec[&CONFIG.common.column_timestamp] = (ts / 1000).into();
 
@@ -778,9 +801,10 @@ fn process_hist_data_point(
                 get_val_for_attr(v);
         }
     }
-    let ts = get_int_value(data_point.get("timeUnixNano").unwrap());
+    let ts = json::get_int_value(data_point.get("timeUnixNano").unwrap());
     if data_point.get("startTimeUnixNano").is_some() {
-        rec["start_time"] = get_string_value(data_point.get("startTimeUnixNano").unwrap()).into();
+        rec["start_time"] =
+            json::get_string_value(data_point.get("startTimeUnixNano").unwrap()).into();
     }
     rec[&CONFIG.common.column_timestamp] = (ts / 1000).into();
     if let Some(v) = data_point.get("flags") {
@@ -795,13 +819,13 @@ fn process_hist_data_point(
 
     // add count record
     let mut count_rec = rec.clone();
-    count_rec[VALUE_LABEL] = get_float_value(data_point.get("count").unwrap()).into();
+    count_rec[VALUE_LABEL] = json::get_float_value(data_point.get("count").unwrap()).into();
     count_rec[NAME_LABEL] = format!("{}_count", count_rec[NAME_LABEL].as_str().unwrap()).into();
     bucket_recs.push(count_rec);
 
     // add sum record
     let mut sum_rec = rec.clone();
-    sum_rec[VALUE_LABEL] = get_float_value(data_point.get("sum").unwrap()).into();
+    sum_rec[VALUE_LABEL] = json::get_float_value(data_point.get("sum").unwrap()).into();
     sum_rec[NAME_LABEL] = format!("{}_sum", sum_rec[NAME_LABEL].as_str().unwrap()).into();
     bucket_recs.push(sum_rec);
 
@@ -817,7 +841,7 @@ fn process_hist_data_point(
         let mut bucket_rec = rec.clone();
         bucket_rec[NAME_LABEL] = format!("{}_bucket", rec[NAME_LABEL].as_str().unwrap()).into();
         if let Some(val) = buckets.get(i) {
-            bucket_rec[VALUE_LABEL] = get_float_value(val).into();
+            bucket_rec[VALUE_LABEL] = json::get_float_value(val).into();
         }
         if let Some(val) = explicit_bounds.get(i) {
             bucket_rec["le"] = (*val.to_string()).into()
@@ -848,9 +872,10 @@ fn process_exp_hist_data_point(
                 get_val_for_attr(v);
         }
     }
-    let ts = get_int_value(data_point.get("timeUnixNano").unwrap());
+    let ts = json::get_int_value(data_point.get("timeUnixNano").unwrap());
     if data_point.get("startTimeUnixNano").is_some() {
-        rec["start_time"] = get_string_value(data_point.get("startTimeUnixNano").unwrap()).into();
+        rec["start_time"] =
+            json::get_string_value(data_point.get("startTimeUnixNano").unwrap()).into();
     }
     rec[&CONFIG.common.column_timestamp] = (ts / 1000).into();
     if let Some(v) = data_point.get("flags") {
@@ -865,13 +890,13 @@ fn process_exp_hist_data_point(
 
     // add count record
     let mut count_rec = rec.clone();
-    count_rec[VALUE_LABEL] = get_float_value(data_point.get("count").unwrap()).into();
+    count_rec[VALUE_LABEL] = json::get_float_value(data_point.get("count").unwrap()).into();
     count_rec[NAME_LABEL] = format!("{}_count", count_rec[NAME_LABEL].as_str().unwrap()).into();
     bucket_recs.push(count_rec);
 
     // add sum record
     let mut sum_rec = rec.clone();
-    sum_rec[VALUE_LABEL] = get_float_value(data_point.get("sum").unwrap()).into();
+    sum_rec[VALUE_LABEL] = json::get_float_value(data_point.get("sum").unwrap()).into();
     sum_rec[NAME_LABEL] = format!("{}_sum", sum_rec[NAME_LABEL].as_str().unwrap()).into();
     bucket_recs.push(sum_rec);
 
@@ -890,7 +915,7 @@ fn process_exp_hist_data_point(
         {
             let mut bucket_rec = rec.clone();
             bucket_rec[NAME_LABEL] = format!("{}_bucket", rec[NAME_LABEL].as_str().unwrap()).into();
-            bucket_rec[VALUE_LABEL] = get_float_value(val).into();
+            bucket_rec[VALUE_LABEL] = json::get_float_value(val).into();
             bucket_rec["le"] = (base ^ (offset + (i as i64) + 1)).to_string().into();
             bucket_recs.push(bucket_rec);
         }
@@ -908,7 +933,7 @@ fn process_exp_hist_data_point(
             .enumerate()
         {
             let mut bucket_rec = rec.clone();
-            bucket_rec[VALUE_LABEL] = get_float_value(val).into();
+            bucket_rec[VALUE_LABEL] = json::get_float_value(val).into();
             bucket_rec["le"] = (base ^ (offset + (i as i64) + 1)).to_string().into();
             bucket_recs.push(bucket_rec);
         }
@@ -935,9 +960,10 @@ fn process_summary_data_point(
                 get_attribute_value(v).into();
         }
     }
-    let ts = get_int_value(data_point.get("timeUnixNano").unwrap());
+    let ts = json::get_int_value(data_point.get("timeUnixNano").unwrap());
     if data_point.get("startTimeUnixNano").is_some() {
-        rec["start_time"] = get_string_value(data_point.get("startTimeUnixNano").unwrap()).into();
+        rec["start_time"] =
+            json::get_string_value(data_point.get("startTimeUnixNano").unwrap()).into();
     }
     rec[&CONFIG.common.column_timestamp] = (ts / 1000).into();
     if let Some(v) = data_point.get("flags") {
@@ -950,13 +976,13 @@ fn process_summary_data_point(
     }
     // add count record
     let mut count_rec = rec.clone();
-    count_rec[VALUE_LABEL] = get_float_value(data_point.get("count").unwrap()).into();
+    count_rec[VALUE_LABEL] = json::get_float_value(data_point.get("count").unwrap()).into();
     count_rec[NAME_LABEL] = format!("{}_count", count_rec[NAME_LABEL].as_str().unwrap()).into();
     bucket_recs.push(count_rec);
 
     // add sum record
     let mut sum_rec = rec.clone();
-    sum_rec[VALUE_LABEL] = get_float_value(data_point.get("sum").unwrap()).into();
+    sum_rec[VALUE_LABEL] = json::get_float_value(data_point.get("sum").unwrap()).into();
     sum_rec[NAME_LABEL] = format!("{}_sum", sum_rec[NAME_LABEL].as_str().unwrap()).into();
     bucket_recs.push(sum_rec);
 
@@ -969,7 +995,7 @@ fn process_summary_data_point(
     for value in buckets {
         let mut bucket_rec = rec.clone();
         let value = value.as_object().unwrap();
-        bucket_rec[VALUE_LABEL] = get_float_value(value.get("value").unwrap()).into();
+        bucket_rec[VALUE_LABEL] = json::get_float_value(value.get("value").unwrap()).into();
         bucket_rec["quantile"] = value.get("quantile").unwrap().clone();
         bucket_recs.push(bucket_rec);
     }
@@ -1053,7 +1079,7 @@ fn set_data_point_value(rec: &mut json::Value, data_point: &json::Map<String, js
     if data_point.get("asInt").is_some() {
         rec[VALUE_LABEL] = (data_point.get("asInt").unwrap().as_i64().unwrap() as f64).into();
     } else {
-        rec[VALUE_LABEL] = get_float_value(data_point.get("asDouble").unwrap()).into();
+        rec[VALUE_LABEL] = json::get_float_value(data_point.get("asDouble").unwrap()).into();
     }
 }
 

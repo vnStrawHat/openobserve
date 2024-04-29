@@ -1,4 +1,4 @@
-// Copyright 2023 Zinc Labs Inc.
+// Copyright 2024 Zinc Labs Inc.
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -20,35 +20,33 @@ use chrono::{Duration, Utc};
 use config::{
     cluster,
     meta::{
-        stream::{PartitionTimeLevel, StreamType},
+        stream::{PartitionTimeLevel, StreamPartition, StreamType},
         usage::UsageType,
     },
     metrics,
     utils::{flatten, json, schema_ext::SchemaExt},
     CONFIG, DISTINCT_FIELDS,
 };
+use infra::schema::unwrap_partition_time_level;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use prost::Message;
 
+use super::BLOCK_FIELDS;
 use crate::{
     common::meta::{
         alerts::Alert,
         http::HttpResponse as MetaHttpResponse,
-        stream::{SchemaRecords, StreamPartition},
+        stream::{SchemaRecords, StreamParams},
         traces::{Event, ExportTracePartialSuccess, ExportTraceServiceResponse, Span, SpanRefType},
     },
     service::{
         db, format_stream_name,
-        ingestion::{
-            evaluate_trigger, get_string_value, get_uint_value, grpc::get_val_for_attr, write_file,
-            TriggerAlertData,
-        },
+        ingestion::{evaluate_trigger, grpc::get_val_for_attr, write_file, TriggerAlertData},
         metadata::{
             distinct_values::DvItem, trace_list_index::TraceListItem, write, MetadataItem,
             MetadataType,
         },
         schema::{check_for_schema, stream_schema_exists, SchemaCache},
-        stream::unwrap_partition_time_level,
         usage::report_request_usage_stats,
     },
 };
@@ -146,16 +144,18 @@ pub async fn traces_json(
 
     // Start get stream alerts
     crate::service::ingestion::get_stream_alerts(
-        org_id,
-        &StreamType::Traces,
-        &traces_stream_name,
+        &[StreamParams {
+            org_id: org_id.to_owned().into(),
+            stream_name: traces_stream_name.to_owned().into(),
+            stream_type: StreamType::Traces,
+        }],
         &mut stream_alerts_map,
     )
     .await;
     // End get stream alert
 
     // Start Register Transforms for stream
-    let (local_trans, stream_vrl_map) = crate::service::ingestion::register_stream_transforms(
+    let (local_trans, stream_vrl_map) = crate::service::ingestion::register_stream_functions(
         org_id,
         &StreamType::Traces,
         &traces_stream_name,
@@ -253,13 +253,17 @@ pub async fn traces_json(
                             .insert(REF_TYPE.to_string(), format!("{:?}", SpanRefType::ChildOf));
                     }
 
-                    let start_time = get_uint_value(span.get("startTimeUnixNano").unwrap());
-                    let end_time = get_uint_value(span.get("endTimeUnixNano").unwrap());
+                    let start_time = json::get_uint_value(span.get("startTimeUnixNano").unwrap());
+                    let end_time = json::get_uint_value(span.get("endTimeUnixNano").unwrap());
                     let mut span_att_map: HashMap<String, json::Value> = HashMap::new();
                     let attributes = span.get("attributes").unwrap().as_array().unwrap();
                     for span_att in attributes {
+                        let mut key = span_att.get("key").unwrap().as_str().unwrap().to_string();
+                        if BLOCK_FIELDS.contains(&key.as_str()) {
+                            key = format!("attr_{}", key);
+                        }
                         span_att_map.insert(
-                            span_att.get("key").unwrap().as_str().unwrap().to_string(),
+                            key,
                             get_val_for_attr(span_att.get("value").unwrap().clone()),
                         );
                     }
@@ -282,7 +286,7 @@ pub async fn traces_json(
                         }
                         events.push(Event {
                             name: event.get("name").unwrap().as_str().unwrap().to_string(),
-                            _timestamp: get_uint_value(event.get("timeUnixNano").unwrap()),
+                            _timestamp: json::get_uint_value(event.get("timeUnixNano").unwrap()),
                             attributes: event_att_map.clone(),
                         })
                     }
@@ -292,7 +296,7 @@ pub async fn traces_json(
                         trace_id: trace_id.clone(),
                         span_id,
                         span_kind: span.get("kind").unwrap().to_string(),
-                        span_status: get_string_value(
+                        span_status: json::get_string_value(
                             span.get("status")
                                 .unwrap_or(&json::Value::String("UNSET".to_string())),
                         ),
@@ -320,7 +324,7 @@ pub async fn traces_json(
                     })?;
 
                     if !local_trans.is_empty() {
-                        value = crate::service::ingestion::apply_stream_transform(
+                        value = crate::service::ingestion::apply_stream_functions(
                             &local_trans,
                             value,
                             &stream_vrl_map,

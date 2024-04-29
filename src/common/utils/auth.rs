@@ -15,15 +15,22 @@
 
 use actix_web::{dev::Payload, Error, FromRequest, HttpRequest};
 use argon2::{password_hash::SaltString, Algorithm, Argon2, Params, PasswordHasher, Version};
+use config::utils::json;
 #[cfg(feature = "enterprise")]
 use config::CONFIG;
 use futures::future::{ready, Ready};
 
 #[cfg(feature = "enterprise")]
+use crate::common::infra::config::USER_SESSIONS;
+#[cfg(feature = "enterprise")]
 use crate::common::meta::ingestion::INGESTION_EP;
 use crate::common::{
     infra::config::{PASSWORD_HASH, USERS},
-    meta::{authz::Authz, organization::DEFAULT_ORG, user::UserRole},
+    meta::{
+        authz::Authz,
+        organization::DEFAULT_ORG,
+        user::{AuthTokens, UserRole},
+    },
 };
 
 pub(crate) fn get_hash(pass: &str, salt: &str) -> String {
@@ -189,7 +196,7 @@ impl FromRequest for AuthExtractor {
             } else {
                 path_columns[0].to_string()
             }
-        } else if url_len == 2 {
+        } else if url_len == 2 || (url_len > 2 && path_columns[1].starts_with("settings")) {
             if method.eq("GET") {
                 method = "LIST".to_string();
             }
@@ -198,7 +205,7 @@ impl FromRequest for AuthExtractor {
                 OFGA_MODELS
                     .get(path_columns[1])
                     .map_or(path_columns[1], |model| model.key),
-                path_columns[url_len - 2]
+                path_columns[0]
             )
         } else if url_len == 3 {
             if path_columns[2].starts_with("alerts")
@@ -234,7 +241,11 @@ impl FromRequest for AuthExtractor {
                     OFGA_MODELS.get("streams").unwrap().key,
                     path_columns[1]
                 )
-            } else if method.eq("PUT") || method.eq("DELETE") {
+            } else if method.eq("PUT")
+                || method.eq("DELETE")
+                || path_columns[1].starts_with("reports")
+                || path_columns[1].starts_with("savedviews")
+            {
                 format!(
                     "{}:{}",
                     OFGA_MODELS
@@ -300,10 +311,19 @@ impl FromRequest for AuthExtractor {
             )
         };
 
-        let auth_str = if let Some(cookie) = req.cookie("access_token") {
-            let access_token = cookie.value().to_string();
+        let auth_str = if let Some(cookie) = req.cookie("auth_tokens") {
+            let auth_tokens: AuthTokens = json::from_str(cookie.value()).unwrap_or_default();
+            let access_token = auth_tokens.access_token;
             if access_token.starts_with("Basic") || access_token.starts_with("Bearer") {
                 access_token
+            } else if access_token.starts_with("session") {
+                let session_key = access_token.strip_prefix("session ").unwrap().to_string();
+                match USER_SESSIONS.get(&session_key) {
+                    Some(token) => {
+                        format!("Bearer {}", *token)
+                    }
+                    None => format!("session {}", access_token),
+                }
             } else {
                 format!("Bearer {}", access_token)
             }
@@ -411,8 +431,9 @@ impl FromRequest for AuthExtractor {
 
     #[cfg(not(feature = "enterprise"))]
     fn from_request(req: &HttpRequest, _: &mut Payload) -> Self::Future {
-        let auth_str = if let Some(cookie) = req.cookie("access_token") {
-            let access_token = cookie.value().to_string();
+        let auth_str = if let Some(cookie) = req.cookie("auth_tokens") {
+            let auth_tokens: AuthTokens = json::from_str(cookie.value()).unwrap_or_default();
+            let access_token = auth_tokens.access_token;
             if access_token.starts_with("Basic") || access_token.starts_with("Bearer") {
                 access_token
             } else {

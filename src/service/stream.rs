@@ -13,32 +13,31 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::{collections::HashMap, io::Error};
+use std::io::Error;
 
 use actix_web::{http, http::StatusCode, HttpResponse};
 use config::{
     is_local_disk_storage,
-    meta::{
-        stream::{PartitionTimeLevel, StreamStats, StreamType},
-        usage::Stats,
-    },
+    meta::stream::{StreamSettings, StreamStats, StreamType},
     utils::json,
     CONFIG, SIZE_IN_MB, SQL_FULL_TEXT_SEARCH_FIELDS,
 };
 use datafusion::arrow::datatypes::Schema;
-use infra::cache::stats;
+use infra::{
+    cache::stats,
+    schema::{
+        unwrap_partition_time_level, unwrap_stream_settings, STREAM_SCHEMAS, STREAM_SETTINGS,
+    },
+};
 
 use crate::{
-    common::{
-        infra::config::{STREAM_SCHEMAS, STREAM_SETTINGS},
-        meta::{
-            authz::Authz,
-            http::HttpResponse as MetaHttpResponse,
-            prom,
-            stream::{Stream, StreamProperty, StreamSettings},
-        },
+    common::meta::{
+        authz::Authz,
+        http::HttpResponse as MetaHttpResponse,
+        prom,
+        stream::{Stream, StreamProperty},
     },
-    service::{db, metrics::get_prom_metadata_from_schema, search as SearchService},
+    service::{db, metrics::get_prom_metadata_from_schema},
 };
 
 const LOCAL: &str = "disk";
@@ -49,7 +48,7 @@ pub async fn get_stream(
     stream_name: &str,
     stream_type: StreamType,
 ) -> Result<HttpResponse, Error> {
-    let schema = db::schema::get(org_id, stream_name, stream_type)
+    let schema = infra::schema::get(org_id, stream_name, stream_type)
         .await
         .unwrap();
 
@@ -79,7 +78,7 @@ pub async fn get_streams(
     let filtered_indices = if let Some(s_type) = stream_type {
         match permitted_streams {
             Some(permitted_streams) => {
-                if permitted_streams.contains(&format!("{}:{}", s_type, org_id)) {
+                if permitted_streams.contains(&format!("{}:_all_{}", s_type, org_id)) {
                     indices
                 } else {
                     indices
@@ -164,7 +163,7 @@ pub fn stream_res(
         None
     };
 
-    let mut settings = stream_settings(&schema).unwrap_or_default();
+    let mut settings = unwrap_stream_settings(&schema).unwrap_or_default();
     settings.partition_time_level = Some(unwrap_partition_time_level(
         settings.partition_time_level,
         stream_type,
@@ -209,10 +208,12 @@ pub async fn save_stream_settings(
 
     // we need to keep the old partition information, because the hash bucket num can't be changed
     // get old settings and then update partition_keys
-    let schema = db::schema::get(org_id, stream_name, stream_type)
+    let schema = infra::schema::get(org_id, stream_name, stream_type)
         .await
         .unwrap();
-    let mut old_partition_keys = stream_settings(&schema).unwrap_or_default().partition_keys;
+    let mut old_partition_keys = unwrap_stream_settings(&schema)
+        .unwrap_or_default()
+        .partition_keys;
     // first disable all old partition keys
     for v in old_partition_keys.iter_mut() {
         v.disabled = true;
@@ -241,7 +242,7 @@ pub async fn save_stream_settings(
             chrono::Utc::now().timestamp_micros().to_string(),
         );
     }
-    db::schema::update_metadata(org_id, stream_name, stream_type, metadata)
+    db::schema::update_setting(org_id, stream_name, stream_type, metadata)
         .await
         .unwrap();
 
@@ -257,7 +258,7 @@ pub async fn delete_stream(
     stream_name: &str,
     stream_type: StreamType,
 ) -> Result<HttpResponse, Error> {
-    let schema = db::schema::get_versions(org_id, stream_name, stream_type)
+    let schema = infra::schema::get_versions(org_id, stream_name, stream_type)
         .await
         .unwrap();
     if schema.is_empty() {
@@ -327,7 +328,7 @@ pub async fn delete_stream(
 }
 
 pub fn get_stream_setting_fts_fields(schema: &Schema) -> Result<Vec<String>, anyhow::Error> {
-    match stream_settings(schema) {
+    match unwrap_stream_settings(schema) {
         Some(setting) => Ok(setting.full_text_search_keys),
         None => Ok(vec![]),
     }
@@ -336,7 +337,7 @@ pub fn get_stream_setting_fts_fields(schema: &Schema) -> Result<Vec<String>, any
 pub fn get_stream_setting_bloom_filter_fields(
     schema: &Schema,
 ) -> Result<Vec<String>, anyhow::Error> {
-    match stream_settings(schema) {
+    match unwrap_stream_settings(schema) {
         Some(setting) => Ok(setting.bloom_filter_fields),
         None => Ok(vec![]),
     }
@@ -354,37 +355,6 @@ pub fn stream_created(schema: &Schema) -> Option<i64> {
         .metadata()
         .get("created_at")
         .map(|v| v.parse().unwrap())
-}
-
-pub fn stream_settings(schema: &Schema) -> Option<StreamSettings> {
-    if schema.metadata().is_empty() {
-        return None;
-    }
-    schema
-        .metadata()
-        .get("settings")
-        .map(|v| StreamSettings::from(v.as_str()))
-}
-
-pub fn unwrap_partition_time_level(
-    level: Option<PartitionTimeLevel>,
-    stream_type: StreamType,
-) -> PartitionTimeLevel {
-    let level = level.unwrap_or_default();
-    if level != PartitionTimeLevel::Unset {
-        level
-    } else {
-        match stream_type {
-            StreamType::Logs => PartitionTimeLevel::from(CONFIG.limit.logs_file_retention.as_str()),
-            StreamType::Metrics => {
-                PartitionTimeLevel::from(CONFIG.limit.metrics_file_retention.as_str())
-            }
-            StreamType::Traces => {
-                PartitionTimeLevel::from(CONFIG.limit.traces_file_retention.as_str())
-            }
-            _ => PartitionTimeLevel::default(),
-        }
-    }
 }
 
 pub async fn delete_fields(
@@ -409,65 +379,6 @@ pub async fn delete_fields(
     )
     .await?;
     Ok(())
-}
-
-/// get stream stats from usage report
-async fn _get_stream_stats(
-    org_id: &str,
-    stream_type: Option<StreamType>,
-    stream_name: Option<String>,
-) -> Result<HashMap<String, StreamStats>, anyhow::Error> {
-    let mut sql = if CONFIG.common.usage_report_compressed_size {
-        format!(
-            "select min(min_ts) as min_ts  , max(max_ts) as max_ts , max(compressed_size) as compressed_size , max(original_size) as original_size , max(records) as records ,stream_name , org_id , stream_type from  \"stats\" where org_id='{org_id}' "
-        )
-    } else {
-        format!(
-            "select min(min_ts) as min_ts  , max(max_ts) as max_ts , max(original_size) as original_size , max(records) as records ,stream_name , org_id , stream_type from  \"stats\" where org_id='{org_id}'"
-        )
-    };
-
-    sql = match stream_type {
-        Some(stream_type) => {
-            format!("{sql } and stream_type='{stream_type}' ")
-        }
-        None => sql,
-    };
-
-    sql = match stream_name {
-        Some(stream_name) => format!("{sql} and stream_name='{stream_name}' "),
-        None => sql,
-    };
-
-    // group by stream_name , org_id , stream_type
-
-    let query = config::meta::search::Query {
-        sql: format!("{sql} group by stream_name , org_id , stream_type"),
-        sql_mode: "full".to_owned(),
-        size: 100000000,
-        ..Default::default()
-    };
-
-    let req = config::meta::search::Request {
-        query,
-        aggs: HashMap::new(),
-        encoding: config::meta::search::RequestEncoding::Empty,
-        timeout: 0,
-    };
-    match SearchService::search("", &CONFIG.common.usage_org, StreamType::Logs, None, &req).await {
-        Ok(res) => {
-            let mut all_stats = HashMap::new();
-            for item in res.hits {
-                let stats: Stats = json::from_value(item).unwrap();
-                all_stats.insert(
-                    format!("{}/{}", stats.stream_name, stats.stream_type),
-                    stats.into(),
-                );
-            }
-            Ok(all_stats)
-        }
-        Err(err) => Err(err.into()),
-    }
 }
 
 #[cfg(test)]

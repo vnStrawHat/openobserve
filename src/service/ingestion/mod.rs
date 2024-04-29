@@ -1,4 +1,4 @@
-// Copyright 2023 Zinc Labs Inc.
+// Copyright 2024 Zinc Labs Inc.
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -19,18 +19,15 @@ use std::{
 };
 
 use anyhow::{anyhow, Result};
-use chrono::{TimeZone, Utc};
+use chrono::{Duration, TimeZone, Utc};
 use config::{
     cluster,
     meta::{
-        stream::{PartitionTimeLevel, StreamType},
-        usage::RequestStats,
+        stream::{PartitionTimeLevel, PartitioningDetails, Routing, StreamPartition, StreamType},
+        usage::{RequestStats, TriggerData, TriggerDataStatus, TriggerDataType},
     },
-    utils::{
-        flatten,
-        json::{self, Map, Value},
-    },
-    SIZE_IN_MB,
+    utils::{flatten, json::*},
+    CONFIG, SIZE_IN_MB,
 };
 use vector_enrichment::TableRegistry;
 use vrl::{
@@ -38,17 +35,18 @@ use vrl::{
     prelude::state,
 };
 
+use super::usage::publish_triggers_usage;
 use crate::{
     common::{
-        infra::config::{STREAM_ALERTS, STREAM_FUNCTIONS},
+        infra::config::{REALTIME_ALERT_TRIGGERS, STREAM_ALERTS, STREAM_FUNCTIONS},
         meta::{
             alerts::Alert,
             functions::{StreamTransform, VRLResultResolver, VRLRuntimeConfig},
-            stream::{PartitioningDetails, SchemaRecords, StreamPartition},
+            stream::{SchemaRecords, StreamParams},
         },
         utils::functions::get_vrl_compiler_config,
     },
-    service::{db, format_partition_key},
+    service::{db, format_partition_key, format_stream_name},
 };
 
 pub mod grpc;
@@ -115,21 +113,27 @@ pub fn apply_vrl_fn(runtime: &mut Runtime, vrl_runtime: &VRLResultResolver, row:
     }
 }
 
-pub async fn get_stream_transforms<'a>(
-    org_id: &str,
-    stream_type: &StreamType,
-    stream_name: &str,
-    stream_transform_map: &mut HashMap<String, Vec<StreamTransform>>,
+pub async fn get_stream_functions<'a>(
+    streams: &[StreamParams],
+    stream_functions_map: &mut HashMap<String, Vec<StreamTransform>>,
     stream_vrl_map: &mut HashMap<String, VRLResultResolver>,
 ) {
-    let key = format!("{}/{}/{}", org_id, stream_type, stream_name);
-    if stream_transform_map.contains_key(&key) {
-        return;
+    for stream in streams {
+        let key = format!(
+            "{}/{}/{}",
+            stream.org_id, stream.stream_type, stream.stream_name
+        );
+        if stream_functions_map.contains_key(&key) {
+            return;
+        }
+        let mut _local_trans: Vec<StreamTransform> = vec![];
+        (_local_trans, *stream_vrl_map) = crate::service::ingestion::register_stream_functions(
+            &stream.org_id,
+            &stream.stream_type,
+            &stream.stream_name,
+        );
+        stream_functions_map.insert(key, _local_trans);
     }
-    let mut _local_trans: Vec<StreamTransform> = vec![];
-    (_local_trans, *stream_vrl_map) =
-        crate::service::ingestion::register_stream_transforms(org_id, stream_type, stream_name);
-    stream_transform_map.insert(key, _local_trans);
 }
 
 pub async fn get_stream_partition_keys(
@@ -137,7 +141,7 @@ pub async fn get_stream_partition_keys(
     stream_type: &StreamType,
     stream_name: &str,
 ) -> PartitioningDetails {
-    let stream_settings = db::schema::get_settings(org_id, stream_name, *stream_type)
+    let stream_settings = infra::schema::get_settings(org_id, stream_name, *stream_type)
         .await
         .unwrap_or_default();
     PartitioningDetails {
@@ -147,29 +151,40 @@ pub async fn get_stream_partition_keys(
 }
 
 pub async fn get_stream_alerts(
-    org_id: &str,
-    stream_type: &StreamType,
-    stream_name: &str,
+    streams: &[StreamParams],
     stream_alerts_map: &mut HashMap<String, Vec<Alert>>,
 ) {
-    let key = format!("{}/{}/{}", org_id, stream_type, stream_name);
-    if stream_alerts_map.contains_key(&key) {
-        return;
-    }
+    for stream in streams {
+        let key = format!(
+            "{}/{}/{}",
+            stream.org_id, stream.stream_type, stream.stream_name
+        );
+        if stream_alerts_map.contains_key(&key) {
+            return;
+        }
 
-    let alerts_cacher = STREAM_ALERTS.read().await;
-    let alerts_list = alerts_cacher.get(&key);
-    if alerts_list.is_none() {
-        return;
-    }
-    let alerts = alerts_list
-        .unwrap()
-        .iter()
-        .filter(|alert| alert.enabled && alert.is_real_time)
-        .cloned()
-        .collect::<Vec<_>>();
+        let alerts_cacher = STREAM_ALERTS.read().await;
+        let alerts_list = alerts_cacher.get(&key);
+        if alerts_list.is_none() {
+            return;
+        }
+        let triggers_cache = REALTIME_ALERT_TRIGGERS.read().await;
+        let alerts = alerts_list
+            .unwrap()
+            .iter()
+            .filter(|alert| alert.enabled && alert.is_real_time)
+            .filter(|alert| {
+                let key = format!("{}/{}", key, alert.name);
+                match triggers_cache.get(&key) {
+                    Some(v) => !v.is_silenced,
+                    None => true,
+                }
+            })
+            .cloned()
+            .collect::<Vec<_>>();
 
-    stream_alerts_map.insert(key, alerts);
+        stream_alerts_map.insert(key, alerts);
+    }
 }
 
 pub async fn evaluate_trigger(trigger: Option<TriggerAlertData>) {
@@ -177,10 +192,62 @@ pub async fn evaluate_trigger(trigger: Option<TriggerAlertData>) {
         return;
     }
     let trigger = trigger.unwrap();
+    let mut trigger_usage_reports = vec![];
     for (alert, val) in trigger.iter() {
+        let module_key = format!(
+            "{}/{}/{}",
+            &alert.stream_type, &alert.stream_name, &alert.name
+        );
+        let now = Utc::now().timestamp_micros();
+        let mut trigger_data_stream = TriggerData {
+            org: alert.org_id.to_string(),
+            module: TriggerDataType::Alert,
+            key: module_key.clone(),
+            next_run_at: now,
+            is_realtime: true,
+            is_silenced: false,
+            status: TriggerDataStatus::Completed,
+            start_time: now,
+            end_time: 0,
+            retries: 0,
+            error: None,
+        };
         if let Err(e) = alert.send_notification(val).await {
-            log::error!("Failed to send notification: {}", e)
+            log::error!("Failed to send notification: {}", e);
+            trigger_data_stream.status = TriggerDataStatus::Failed;
+            trigger_data_stream.error = Some(format!("error sending notification for alert: {e}"));
+        } else if alert.trigger_condition.silence > 0 {
+            log::debug!(
+                "Realtime alert {}/{}/{}/{} triggered successfully, hence applying silence period",
+                &alert.org_id,
+                &alert.stream_type,
+                &alert.stream_name,
+                &alert.name
+            );
+            // After the notification is sent successfully, we need to update
+            // the silence period of the trigger
+            _ = db::scheduler::update_trigger(db::scheduler::Trigger {
+                org: alert.org_id.to_string(),
+                module: db::scheduler::TriggerModule::Alert,
+                module_key,
+                is_silenced: true,
+                is_realtime: true,
+                next_run_at: Utc::now().timestamp_micros()
+                    + Duration::try_minutes(alert.trigger_condition.silence)
+                        .unwrap()
+                        .num_microseconds()
+                        .unwrap(),
+                ..Default::default()
+            })
+            .await;
         }
+        trigger_data_stream.end_time = Utc::now().timestamp_micros();
+        // Let all the alerts send notifications first
+        trigger_usage_reports.push(trigger_data_stream);
+    }
+
+    for trigger_data_stream in trigger_usage_reports {
+        publish_triggers_usage(trigger_data_stream).await;
     }
 }
 
@@ -223,7 +290,7 @@ pub fn get_wal_time_key(
     time_key
 }
 
-pub fn register_stream_transforms(
+pub fn register_stream_functions(
     org_id: &str,
     stream_type: &StreamType,
     stream_name: &str,
@@ -258,7 +325,7 @@ pub fn register_stream_transforms(
     (local_trans, stream_vrl_map)
 }
 
-pub fn apply_stream_transform(
+pub fn apply_stream_functions(
     local_trans: &[StreamTransform],
     mut value: Value,
     stream_vrl_map: &HashMap<String, VRLResultResolver>,
@@ -272,7 +339,7 @@ pub fn apply_stream_transform(
             value = apply_vrl_fn(runtime, vrl_runtime, &value);
         }
     }
-    flatten::flatten(value)
+    flatten::flatten_with_level(value, CONFIG.limit.ingest_flatten_level)
 }
 
 pub fn init_functions_runtime() -> Runtime {
@@ -330,65 +397,25 @@ pub fn check_ingestion_allowed(org_id: &str, stream_name: Option<&str>) -> Resul
     Ok(())
 }
 
-pub fn get_float_value(val: &Value) -> f64 {
-    match val {
-        Value::String(v) => v.parse::<f64>().unwrap_or(0.0),
-        Value::Number(v) => v.as_f64().unwrap_or(0.0),
-        _ => 0.0,
-    }
-}
-
-pub fn get_int_value(val: &Value) -> i64 {
-    match val {
-        Value::String(v) => v.parse::<i64>().unwrap_or(0),
-        Value::Number(v) => v.as_i64().unwrap_or(0),
-        _ => 0,
-    }
-}
-
-pub fn get_uint_value(val: &Value) -> u64 {
-    match val {
-        Value::String(v) => v.parse::<u64>().unwrap_or(0),
-        Value::Number(v) => v.as_u64().unwrap_or(0),
-        _ => 0,
-    }
-}
-
-pub fn get_string_value(value: &Value) -> String {
-    if value.is_boolean() {
-        value.as_bool().unwrap_or_default().to_string()
-    } else if value.is_i64() {
-        value.as_i64().unwrap_or_default().to_string()
-    } else if value.is_u64() {
-        value.as_u64().unwrap_or_default().to_string()
-    } else if value.is_f64() {
-        value.as_f64().unwrap_or_default().to_string()
-    } else if value.is_string() {
-        value.as_str().unwrap_or_default().to_string()
-    } else {
-        value.to_string()
-    }
-}
-
 pub fn get_val_for_attr(attr_val: &Value) -> Value {
     let local_val = attr_val.as_object().unwrap();
     if let Some((key, value)) = local_val.into_iter().next() {
         match key.as_str() {
             "stringValue" | "string_value" => {
-                return json::json!(get_string_value(value));
+                return json!(get_string_value(value));
             }
             "boolValue" | "bool_value" => {
-                return json::json!(value.as_bool().unwrap_or(false).to_string());
+                return json!(value.as_bool().unwrap_or(false).to_string());
             }
             "intValue" | "int_value" => {
-                return json::json!(get_int_value(value).to_string());
+                return json!(get_int_value(value).to_string());
             }
             "doubleValue" | "double_value" => {
-                return json::json!(get_float_value(value).to_string());
+                return json!(get_float_value(value).to_string());
             }
 
             "bytesValue" | "bytes_value" => {
-                return json::json!(value.as_str().unwrap_or("").to_string());
+                return json!(value.as_str().unwrap_or("").to_string());
             }
 
             "arrayValue" | "array_value" => {
@@ -402,11 +429,11 @@ pub fn get_val_for_attr(attr_val: &Value) -> Value {
                 {
                     vals.push(get_val_for_attr(item));
                 }
-                return json::json!(vals);
+                return json!(vals);
             }
 
             "kvlistValue" | "kvlist_value" => {
-                let mut vals = json::Map::new();
+                let mut vals = Map::new();
                 for item in value
                     .get("values")
                     .unwrap()
@@ -419,11 +446,11 @@ pub fn get_val_for_attr(attr_val: &Value) -> Value {
                     let value = item.get("value").unwrap().clone();
                     vals.insert(key, get_val_for_attr(&value));
                 }
-                return json::json!(vals);
+                return json!(vals);
             }
 
             _ => {
-                return json::json!(get_string_value(value));
+                return json!(get_string_value(value));
             }
         }
     };
@@ -433,28 +460,70 @@ pub fn get_val_for_attr(attr_val: &Value) -> Value {
 pub fn get_val_with_type_retained(val: &Value) -> Value {
     match val {
         Value::String(val) => {
-            json::json!(val)
+            json!(val)
         }
         Value::Bool(val) => {
-            json::json!(val)
+            json!(val)
         }
         Value::Number(val) => {
-            json::json!(val)
+            json!(val)
         }
         Value::Array(val) => {
-            json::json!(val)
+            json!(val)
         }
         Value::Object(val) => {
-            json::json!(val)
+            json!(val)
         }
         Value::Null => Value::Null,
     }
 }
 
+pub async fn get_stream_routing(
+    stream_params: StreamParams,
+    stream_routing_map: &mut HashMap<String, Vec<Routing>>,
+) {
+    let stream_settings = infra::schema::get_settings(
+        &stream_params.org_id,
+        &stream_params.stream_name,
+        stream_params.stream_type,
+    )
+    .await
+    .unwrap_or_default();
+    let res: Vec<Routing> = stream_settings
+        .routing
+        .unwrap_or_default()
+        .iter()
+        .map(|(k, v)| Routing {
+            destination: format_stream_name(k),
+            routing: v.clone(),
+        })
+        .collect();
+
+    stream_routing_map.insert(stream_params.stream_name.to_string(), res);
+}
+
+pub async fn get_user_defined_schema(
+    streams: &[StreamParams],
+    user_defined_schema_map: &mut HashMap<String, Vec<String>>,
+) {
+    for stream in streams {
+        let stream_settings =
+            infra::schema::get_settings(&stream.org_id, &stream.stream_name, stream.stream_type)
+                .await
+                .unwrap_or_default();
+        if let Some(fields) = stream_settings.defined_schema_fields {
+            if !fields.is_empty() {
+                user_defined_schema_map.insert(stream.stream_name.to_string(), fields);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use infra::schema::{unwrap_stream_settings, STREAM_SETTINGS};
+
     use super::*;
-    use crate::{common::infra::config::STREAM_SETTINGS, service::stream::stream_settings};
 
     #[test]
     fn test_format_partition_key() {
@@ -517,7 +586,7 @@ mod tests {
             r#"{"partition_keys": {"country": "country", "sport": "sport"}}"#.to_string(),
         );
         let schema = arrow_schema::Schema::empty().with_metadata(meta);
-        let settings = stream_settings(&schema).unwrap();
+        let settings = unwrap_stream_settings(&schema).unwrap();
         let mut w = STREAM_SETTINGS.write().await;
         w.insert("default/logs/olympics".to_string(), settings);
         drop(w);

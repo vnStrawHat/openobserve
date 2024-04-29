@@ -19,31 +19,33 @@ use config::{
     is_local_disk_storage,
     meta::{
         search::{ScanStats, SearchType, StorageType},
-        stream::{FileKey, PartitionTimeLevel, StreamType},
+        stream::{FileKey, PartitionTimeLevel, StreamPartition, StreamType},
     },
+    utils::schema_ext::SchemaExt,
     CONFIG,
 };
-use datafusion::{
-    arrow::{datatypes::Schema, record_batch::RecordBatch},
-    common::FileType,
-};
+use datafusion::{arrow::record_batch::RecordBatch, common::FileType};
 use futures::future::try_join_all;
 use hashbrown::HashMap;
 use infra::{
     cache::file_data,
     errors::{Error, ErrorCodes},
+    schema::{unwrap_partition_time_level, unwrap_stream_settings},
 };
 use tokio::{sync::Semaphore, time::Duration};
 use tracing::{info_span, Instrument};
 
-use crate::{
-    common::meta::stream::StreamPartition,
-    service::{
-        db, file_list,
-        search::{datafusion::exec, sql::Sql},
-        stream,
+use crate::service::{
+    db, file_list,
+    search::{
+        datafusion::exec,
+        grpc::{generate_search_schema, generate_select_start_search_schema},
+        sql::Sql,
+        RE_SELECT_WILDCARD,
     },
 };
+
+type CachedFiles = (usize, usize);
 
 /// search in remote object storage
 #[tracing::instrument(name = "service:search:grpc:storage:enter", skip_all, fields(trace_id, org_id = sql.org_id, stream_name = sql.stream_name))]
@@ -57,7 +59,7 @@ pub async fn search(
 ) -> super::SearchResult {
     // fetch all schema versions, group files by version
     let schema_versions =
-        match db::schema::get_versions(&sql.org_id, &sql.stream_name, stream_type).await {
+        match infra::schema::get_versions(&sql.org_id, &sql.stream_name, stream_type).await {
             Ok(versions) => versions,
             Err(err) => {
                 log::error!("[trace_id {trace_id}] get schema error: {}", err);
@@ -72,9 +74,9 @@ pub async fn search(
     let schema_latest = schema_versions.last().unwrap();
     let schema_latest_id = schema_versions.len() - 1;
 
-    let stream_settings = stream::stream_settings(schema_latest).unwrap_or_default();
+    let stream_settings = unwrap_stream_settings(schema_latest).unwrap_or_default();
     let partition_time_level =
-        stream::unwrap_partition_time_level(stream_settings.partition_time_level, stream_type);
+        unwrap_partition_time_level(stream_settings.partition_time_level, stream_type);
 
     // get file list
     let files = match file_list.is_empty() {
@@ -137,7 +139,7 @@ pub async fn search(
                         file.meta.min_ts,
                         file.meta.max_ts
                     );
-                    // HACK: use the latest verion if not found in schema versions
+                    // HACK: use the latest version if not found in schema versions
                     schema_latest_id
                 }
             };
@@ -161,33 +163,44 @@ pub async fn search(
     }
 
     // load files to local cache
-    let (cache_type, deleted_files) = cache_parquet_files(trace_id, &files, &scan_stats).await?;
+    let (cache_type, deleted_files, (mem_cached_files, disk_cached_files)) =
+        cache_parquet_files(trace_id, &files, &scan_stats).await?;
     if !deleted_files.is_empty() {
         // remove deleted files from files_group
         for (_, g_files) in files_group.iter_mut() {
             g_files.retain(|f| !deleted_files.contains(&f.key));
         }
     }
+    scan_stats.querier_files = scan_stats.files;
+    scan_stats.querier_memory_cached_files = mem_cached_files as i64;
+    scan_stats.querier_disk_cached_files = disk_cached_files as i64;
     log::info!(
-        "[trace_id {trace_id}] search->storage: stream {}/{}/{}, load files {}, into {:?} cache done",
+        "[trace_id {trace_id}] search->storage: stream {}/{}/{}, load files {}, memory cached {}, disk cached {}, download others into {:?} cache done",
         &sql.org_id,
         &stream_type,
         &sql.stream_name,
-        scan_stats.files,
+        scan_stats.querier_files,
+        scan_stats.querier_memory_cached_files,
+        scan_stats.querier_disk_cached_files,
         cache_type,
     );
 
     // construct latest schema map
     let mut schema_latest_map = HashMap::with_capacity(schema_latest.fields().len());
     for field in schema_latest.fields() {
-        schema_latest_map.insert(field.name(), field.data_type());
+        schema_latest_map.insert(field.name(), field);
     }
+    let select_wildcard = RE_SELECT_WILDCARD.is_match(sql.origin_sql.as_str());
 
     let mut tasks = Vec::new();
     for (ver, files) in files_group {
-        let mut schema = schema_versions[ver]
-            .clone()
-            .with_metadata(std::collections::HashMap::new());
+        let schema = schema_versions[ver].clone();
+        let schema_dt = schema
+            .metadata()
+            .get("start_dt")
+            .cloned()
+            .unwrap_or_default();
+        let schema = schema.with_metadata(std::collections::HashMap::new());
         let sql = sql.clone();
         let session = config::meta::search::Session {
             id: format!("{trace_id}-{ver}"),
@@ -199,34 +212,14 @@ pub async fn search(
             },
             work_group: Some(work_group.to_string()),
         };
+
         // cacluate the diff between latest schema and group schema
-        let mut diff_fields = HashMap::new();
-        let group_fields = schema.fields();
-        for field in group_fields {
-            if let Some(data_type) = schema_latest_map.get(field.name()) {
-                if *data_type != field.data_type() {
-                    diff_fields.insert(field.name().clone(), (*data_type).clone());
-                }
-            }
-        }
-        for (field, alias) in sql.meta.field_alias.iter() {
-            if let Some(v) = diff_fields.get(field) {
-                diff_fields.insert(alias.to_string(), v.clone());
-            }
-        }
-        // add not exists field for wal infered schema
-        let mut new_fields = Vec::new();
-        for field in sql.meta.fields.iter() {
-            if schema.field_with_name(field).is_err() {
-                if let Ok(field) = schema_latest.field_with_name(field) {
-                    new_fields.push(Arc::new(field.clone()));
-                }
-            }
-        }
-        if !new_fields.is_empty() {
-            let new_schema = Schema::new(new_fields);
-            schema = Schema::try_merge(vec![schema, new_schema])?;
-        }
+        let (schema, diff_fields) = if select_wildcard {
+            generate_select_start_search_schema(&sql, &schema_latest_map, &schema)?
+        } else {
+            generate_search_schema(&sql, &schema_latest_map, &schema)?
+        };
+
         let datafusion_span = info_span!(
             "service:search:grpc:storage:datafusion",
             trace_id,
@@ -253,19 +246,34 @@ pub async fn search(
             )));
         }
 
-        let schema = Arc::new(schema);
         let task = tokio::task::spawn(
             async move {
                 tokio::select! {
                     ret = exec::sql(
                         &session,
-                        schema,
+                        schema.clone(),
                         &diff_fields,
                         &sql,
                         &files,
                         None,
                         FileType::PARQUET,
-                    ) => ret,
+                    ) => {
+                        match ret {
+                            Ok(ret) => Ok(ret),
+                            Err(err) => {
+                                log::error!("[trace_id {}] search->storage: datafusion execute error: {}", session.id, err);
+                                if err.to_string().contains("Invalid comparison operation") {
+                                    // print the session_id, schema, sql, files
+                                    let schema_version = format!("{}/{}/{}/{}", &sql.org_id, &stream_type, &sql.stream_name, schema_dt);
+                                    let schema_fiels = schema.as_ref().simple_fields();
+                                    let files = files.iter().map(|f| f.key.as_str()).collect::<Vec<_>>();
+                                    log::error!("[trace_id {}] search->storage: schema and parquet mismatch, version: {}, schema: {:?}, files: {:?}", 
+                                        session.id, schema_version, schema_fiels, files);
+                                }
+                                Err(err)
+                            }
+                        }
+                    },
                     _ = tokio::time::sleep(Duration::from_secs(timeout)) => {
                         log::error!("[trace_id {}] search->storage: search timeout", session.id);
                         Err(datafusion::error::DataFusionError::Execution(format!(
@@ -310,7 +318,6 @@ pub async fn search(
                 }
             }
             Err(err) => {
-                log::error!("[trace_id {trace_id}] datafusion execute error: {}", err);
                 return Err(err.into());
             }
         };
@@ -377,7 +384,7 @@ async fn cache_parquet_files(
     trace_id: &str,
     files: &[FileKey],
     scan_stats: &ScanStats,
-) -> Result<(file_data::CacheType, Vec<String>), Error> {
+) -> Result<(file_data::CacheType, Vec<String>, CachedFiles), Error> {
     let cache_type = if CONFIG.memory_cache.enabled
         && scan_stats.compressed_size < CONFIG.memory_cache.skip_size as i64
     {
@@ -391,8 +398,11 @@ async fn cache_parquet_files(
         file_data::CacheType::Disk
     } else {
         // no cache
-        return Ok((file_data::CacheType::None, vec![]));
+        return Ok((file_data::CacheType::None, vec![], (0, 0)));
     };
+
+    let mut mem_cached_files = 0;
+    let mut disk_cached_files = 0;
 
     let mut tasks = Vec::new();
     let semaphore = std::sync::Arc::new(Semaphore::new(CONFIG.limit.query_thread_num));
@@ -400,62 +410,81 @@ async fn cache_parquet_files(
         let trace_id = trace_id.to_string();
         let file_name = file.key.clone();
         let permit = semaphore.clone().acquire_owned().await.unwrap();
-        let task: tokio::task::JoinHandle<Option<String>> = tokio::task::spawn(async move {
-            let ret = match cache_type {
-                file_data::CacheType::Memory => {
-                    if !file_data::memory::exist(&file_name).await
-                        && !file_data::disk::exist(&file_name).await
+        let task: tokio::task::JoinHandle<(Option<String>, bool, bool)> = tokio::task::spawn(
+            async move {
+                let ret = match cache_type {
+                    file_data::CacheType::Memory => {
+                        let mut disk_exists = false;
+                        let mem_exists = file_data::memory::exist(&file_name).await;
+                        if !mem_exists && !CONFIG.memory_cache.skip_disk_check {
+                            // when skip_disk_check = false, need to check disk cache
+                            disk_exists = file_data::disk::exist(&file_name).await;
+                        }
+                        if !mem_exists && (CONFIG.memory_cache.skip_disk_check || !disk_exists) {
+                            (
+                                file_data::memory::download(&trace_id, &file_name)
+                                    .await
+                                    .err(),
+                                false,
+                                false,
+                            )
+                        } else {
+                            (None, mem_exists, disk_exists)
+                        }
+                    }
+                    file_data::CacheType::Disk => {
+                        if !file_data::disk::exist(&file_name).await {
+                            (
+                                file_data::disk::download(&trace_id, &file_name).await.err(),
+                                false,
+                                false,
+                            )
+                        } else {
+                            (None, false, true)
+                        }
+                    }
+                    _ => (None, false, false),
+                };
+                let file_name = if let Some(e) = ret.0 {
+                    if e.to_string().to_lowercase().contains("not found")
+                        || e.to_string().to_lowercase().contains("data size is zero")
                     {
-                        file_data::memory::download(&trace_id, &file_name)
-                            .await
-                            .err()
+                        // delete file from file list
+                        log::warn!("found invalid file: {}", file_name);
+                        if let Err(e) = file_list::delete_parquet_file(&file_name, true).await {
+                            log::error!(
+                                "[trace_id {trace_id}] search->storage: delete from file_list err: {}",
+                                e
+                            );
+                        }
+                        Some(file_name)
                     } else {
-                        None
-                    }
-                }
-                file_data::CacheType::Disk => {
-                    if !file_data::disk::exist(&file_name).await {
-                        file_data::disk::download(&trace_id, &file_name).await.err()
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            };
-            let ret = if let Some(e) = ret {
-                if e.to_string().to_lowercase().contains("not found")
-                    || e.to_string().to_lowercase().contains("data size is zero")
-                {
-                    // delete file from file list
-                    log::warn!("found invalid file: {}", file_name);
-                    if let Err(e) = file_list::delete_parquet_file(&file_name, true).await {
                         log::error!(
-                            "[trace_id {trace_id}] search->storage: delete from file_list err: {}",
+                            "[trace_id {trace_id}] search->storage: download file to cache err: {}",
                             e
                         );
+                        None
                     }
-                    Some(file_name)
                 } else {
-                    log::error!(
-                        "[trace_id {trace_id}] search->storage: download file to cache err: {}",
-                        e
-                    );
                     None
-                }
-            } else {
-                None
-            };
-            drop(permit);
-            ret
-        });
+                };
+                drop(permit);
+                (file_name, ret.1, ret.2)
+            },
+        );
         tasks.push(task);
     }
 
     let mut delete_files = Vec::new();
     for task in tasks {
         match task.await {
-            Ok(ret) => {
-                if let Some(file) = ret {
+            Ok((file, mem_exists, disk_exists)) => {
+                if mem_exists {
+                    mem_cached_files += 1;
+                } else if disk_exists {
+                    disk_cached_files += 1;
+                }
+                if let Some(file) = file {
                     delete_files.push(file);
                 }
             }
@@ -468,5 +497,9 @@ async fn cache_parquet_files(
         }
     }
 
-    Ok((cache_type, delete_files))
+    Ok((
+        cache_type,
+        delete_files,
+        (mem_cached_files, disk_cached_files),
+    ))
 }

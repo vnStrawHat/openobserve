@@ -1,4 +1,4 @@
-// Copyright 2023 Zinc Labs Inc.
+// Copyright 2024 Zinc Labs Inc.
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -19,18 +19,18 @@ use std::{
 };
 
 use actix_web::{delete, get, http, put, web, HttpRequest, HttpResponse, Responder};
-use config::meta::stream::StreamType;
+use config::meta::stream::{RoutingCondition, StreamSettings, StreamType};
 
 use crate::{
     common::{
         meta::{
             self,
             http::HttpResponse as MetaHttpResponse,
-            stream::{ListStream, StreamDeleteFields, StreamSettings},
+            stream::{ListStream, StreamDeleteFields},
         },
         utils::http::get_stream_type_from_request,
     },
-    service::stream,
+    service::{format_stream_name, stream},
 };
 
 /// GetSchema
@@ -93,19 +93,20 @@ async fn schema(
 #[put("/{org_id}/streams/{stream_name}/settings")]
 async fn settings(
     path: web::Path<(String, String)>,
-    settings: web::Json<StreamSettings>,
+    mut settings: web::Json<StreamSettings>,
     req: HttpRequest,
 ) -> Result<HttpResponse, Error> {
     let (org_id, stream_name) = path.into_inner();
+    let stream_name = format_stream_name(&stream_name);
     let query = web::Query::<HashMap<String, String>>::from_query(req.query_string()).unwrap();
     let stream_type = match get_stream_type_from_request(&query) {
         Ok(v) => {
             if let Some(s_type) = v {
-                if s_type == StreamType::EnrichmentTables {
+                if s_type == StreamType::EnrichmentTables || s_type == StreamType::Index {
                     return Ok(
                         HttpResponse::BadRequest().json(meta::http::HttpResponse::error(
                             http::StatusCode::BAD_REQUEST.into(),
-                            "Stream type 'EnrichmentTable' not allowed".to_string(),
+                            format!("Stream type '{}' not allowed", s_type),
                         )),
                     );
                 }
@@ -123,6 +124,15 @@ async fn settings(
             );
         }
     };
+    // if routing is provided format the key using format_stream_name
+    if let Some(ref mut routing_map) = settings.routing {
+        let new_routing: hashbrown::HashMap<String, Vec<RoutingCondition>> = routing_map
+            .drain()
+            .map(|(key, value)| (format_stream_name(&key), value))
+            .collect();
+        settings.routing = Some(new_routing);
+    }
+
     let stream_type = stream_type.unwrap_or(StreamType::Logs);
     stream::save_stream_settings(&org_id, &stream_name, stream_type, settings.into_inner()).await
 }

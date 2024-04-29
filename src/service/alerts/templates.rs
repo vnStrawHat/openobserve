@@ -36,6 +36,7 @@ pub async fn save(
     if !name.is_empty() {
         template.name = name.to_owned();
     }
+    template.name = template.name.trim().to_string();
     if template.name.is_empty() {
         return Err(anyhow::anyhow!("Alert template name is required"));
     }
@@ -89,7 +90,7 @@ pub async fn list(
                     || permitted
                         .as_ref()
                         .unwrap()
-                        .contains(&format!("template:{}", org_id))
+                        .contains(&format!("template:_all_{}", org_id))
                 {
                     result.push(template);
                 }

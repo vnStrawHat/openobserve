@@ -22,30 +22,29 @@ use chrono::Duration;
 use config::{
     meta::{
         sql::{Sql as MetaSql, SqlOperator},
-        stream::{FileKey, StreamType},
+        stream::{FileKey, StreamPartition, StreamType},
     },
     CONFIG, QUICK_MODEL_FIELDS, SQL_FULL_TEXT_SEARCH_FIELDS,
 };
 use datafusion::arrow::datatypes::{DataType, Schema};
 use hashbrown::HashSet;
-use infra::errors::{Error, ErrorCodes};
+use infra::{
+    errors::{Error, ErrorCodes},
+    schema::STREAM_SCHEMAS_FIELDS,
+};
 use once_cell::sync::Lazy;
 use proto::cluster_rpc;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    common::{
-        infra::config::STREAM_SCHEMAS_FIELDS,
-        meta::stream::{StreamParams, StreamPartition},
-    },
-    service::{db, search::match_source, stream::get_stream_setting_fts_fields},
+    common::meta::stream::StreamParams,
+    service::{search::match_source, stream::get_stream_setting_fts_fields},
 };
 
 const SQL_DELIMITERS: [u8; 12] = [
     b' ', b'*', b'(', b')', b'<', b'>', b',', b';', b'=', b'!', b'\r', b'\n',
 ];
-const SQL_DEFAULT_FULL_MODE_LIMIT: usize = 1000;
 
 static RE_ONLY_SELECT: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)select[ ]+\*").unwrap());
 static RE_ONLY_GROUPBY: Lazy<Regex> =
@@ -337,7 +336,7 @@ impl Sql {
             if meta.limit == 0 && sql_mode.eq(&SqlMode::Full) {
                 // sql mode context, allow limit 0, used to no hits, but return aggs
                 // sql mode full, disallow without limit, default limit 1000
-                meta.limit = SQL_DEFAULT_FULL_MODE_LIMIT;
+                meta.limit = CONFIG.limit.query_full_mode_limit;
             }
             origin_sql = if meta.order_by.is_empty() && !sql_mode.eq(&SqlMode::Full) {
                 let sort_by = if req_query.sort_by.is_empty() {
@@ -369,7 +368,7 @@ impl Sql {
         }
 
         // fetch schema
-        let schema = match db::schema::get(&org_id, &meta.source, stream_type).await {
+        let schema = match infra::schema::get(&org_id, &meta.source, stream_type).await {
             Ok(schema) => schema,
             Err(_) => Schema::empty(),
         };
@@ -467,6 +466,9 @@ impl Sql {
                 }
                 indexed_search.push(format!("\"{}\" {} '%{}%'", field.name(), func, item.1));
 
+                // add full text field to meta fields
+                meta.fields.push(field.name().to_string());
+
                 fts_terms.insert(item.1.clone());
             }
             if indexed_search.is_empty() {
@@ -490,6 +492,8 @@ impl Sql {
                     func = "ILIKE";
                 }
                 fulltext_search.push(format!("\"{}\" {} '%{}%'", field.name(), func, item.1));
+                // add full text field to meta fields
+                meta.fields.push(field.name().to_string());
             }
             if fulltext_search.is_empty() {
                 return Err(Error::ErrorCode(ErrorCodes::FullTextSearchFieldNotFound));
@@ -995,12 +999,14 @@ mod tests {
             query_context: None,
             uses_zo_fn: false,
             query_fn: None,
+            skip_wal: false,
         };
 
         let req: config::meta::search::Request = config::meta::search::Request {
             query,
             aggs: HashMap::new(),
             encoding: config::meta::search::RequestEncoding::Empty,
+            clusters: vec![],
             timeout: 0,
         };
 
@@ -1103,11 +1109,13 @@ mod tests {
                 query_context: None,
                 uses_zo_fn: false,
                 query_fn: None,
+                skip_wal: false,
             };
             let req = config::meta::search::Request {
                 query: query.clone(),
                 aggs: HashMap::new(),
                 encoding: config::meta::search::RequestEncoding::Empty,
+                clusters: vec![],
                 timeout: 0,
             };
             let mut rpc_req: cluster_rpc::SearchRequest = req.to_owned().into();
@@ -1223,11 +1231,13 @@ mod tests {
                 query_context: None,
                 uses_zo_fn: false,
                 query_fn: None,
+                skip_wal: false,
             };
             let req = config::meta::search::Request {
                 query: query.clone(),
                 aggs: HashMap::new(),
                 encoding: config::meta::search::RequestEncoding::Empty,
+                clusters: vec![],
                 timeout: 0,
             };
             let mut rpc_req: cluster_rpc::SearchRequest = req.to_owned().into();

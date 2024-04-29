@@ -148,8 +148,31 @@ pub async fn get(org_id: &str, name: &str) -> Result<Report, anyhow::Error> {
         .map_err(|_| anyhow::anyhow!("Report not found"))
 }
 
-pub async fn list(org_id: &str) -> Result<Vec<Report>, anyhow::Error> {
-    db::dashboards::reports::list(org_id).await
+pub async fn list(
+    org_id: &str,
+    permitted: Option<Vec<String>>,
+) -> Result<Vec<Report>, anyhow::Error> {
+    match db::dashboards::reports::list(org_id).await {
+        Ok(reports) => {
+            let mut result = Vec::new();
+            for report in reports {
+                if permitted.is_none()
+                    || permitted
+                        .as_ref()
+                        .unwrap()
+                        .contains(&format!("report:{}", report.name))
+                    || permitted
+                        .as_ref()
+                        .unwrap()
+                        .contains(&format!("report:_all_{}", org_id))
+                {
+                    result.push(report);
+                }
+            }
+            Ok(result)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 pub async fn delete(org_id: &str, name: &str) -> Result<(), (http::StatusCode, anyhow::Error)> {
@@ -246,6 +269,10 @@ impl Report {
             email = email.to(recepient.parse()?);
         }
 
+        if !CONFIG.smtp.smtp_reply_to.is_empty() {
+            email = email.reply_to(CONFIG.smtp.smtp_reply_to.parse()?);
+        }
+
         let email = email
             .multipart(
                 MultiPart::mixed()
@@ -298,6 +325,7 @@ async fn generate_report(
     log::info!("launching browser for dashboard {dashboard_id}");
     let (mut browser, mut handler) =
         Browser::launch(get_chrome_launch_options().await.as_ref().unwrap().clone()).await?;
+    log::info!("browser launched");
 
     let handle = tokio::task::spawn(async move {
         while let Some(h) = handler.next().await {
@@ -308,15 +336,19 @@ async fn generate_report(
         }
     });
 
-    let web_url = &CONFIG.common.web_url;
+    let web_url = format!("{}{}/web", CONFIG.common.web_url, CONFIG.common.base_uri);
+    log::debug!("Navigating to web url: {}", &web_url);
     let page = browser.new_page(&format!("{web_url}/login")).await?;
     page.disable_log().await?;
+    log::debug!("headless: new page created");
+
     page.find_element("input[type='email']")
         .await?
         .click()
         .await?
         .type_str(user_id)
         .await?;
+    log::debug!("headless: email input filled");
 
     page.find_element("input[type='password']")
         .await?
@@ -326,6 +358,7 @@ async fn generate_report(
         .await?
         .press_key("Enter")
         .await?;
+    log::debug!("headless: password input filled");
 
     // Does not seem to work for single page client application
     page.wait_for_navigation().await?;
@@ -339,7 +372,7 @@ async fn generate_report(
             let period = &timerange.period;
             let (time_duration, time_unit) = period.split_at(period.len() - 1);
             let dashb_url = format!(
-                "{web_url}/dashboards/view?org_identifier={org_id}&dashboard={dashboard_id}&folder={folder_id}&tab={tab_id}&refresh=Off&period={period}&timezone={timezone}&var-__dynamic_filters=%255B%255D&print=true",
+                "{web_url}/dashboards/view?org_identifier={org_id}&dashboard={dashboard_id}&folder={folder_id}&tab={tab_id}&refresh=Off&period={period}&timezone={timezone}&var-Dynamic+filters=%255B%255D&print=true",
             );
 
             let time_duration: i64 = time_duration.parse()?;
@@ -383,20 +416,30 @@ async fn generate_report(
             };
 
             let email_dashb_url = format!(
-                "{web_url}/dashboards/view?org_identifier={org_id}&dashboard={dashboard_id}&folder={folder_id}&tab={tab_id}&refresh=Off&from={start_time}&to={end_time}&timezone={timezone}&var-__dynamic_filters=%255B%255D&print=true",
+                "{web_url}/dashboards/view?org_identifier={org_id}&dashboard={dashboard_id}&folder={folder_id}&tab={tab_id}&refresh=Off&from={start_time}&to={end_time}&timezone={timezone}&var-Dynamic+filters=%255B%255D&print=true",
             );
             (dashb_url, email_dashb_url)
         }
         ReportTimerangeType::Absolute => {
             let url = format!(
-                "{web_url}/dashboards/view?org_identifier={org_id}&dashboard={dashboard_id}&folder={folder_id}&tab={tab_id}&refresh=Off&from={}&to={}&timezone={timezone}&var-__dynamic_filters=%255B%255D&print=true",
+                "{web_url}/dashboards/view?org_identifier={org_id}&dashboard={dashboard_id}&folder={folder_id}&tab={tab_id}&refresh=Off&from={}&to={}&timezone={timezone}&var-Dynamic+filters=%255B%255D&print=true",
                 &timerange.from, &timerange.to
             );
             (url.clone(), url)
         }
     };
 
+    log::debug!("headless: going to dash url");
+    // First navigate to the correct org
+    page.goto(&format!("{web_url}/?org_identifier={org_id}"))
+        .await?;
+    page.wait_for_navigation().await?;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    log::debug!("headless: navigated to the org_id: {org_id}");
+
     page.goto(&dashb_url).await?;
+    log::debug!("headless: going to dash url");
+
     // Wait for navigation does not really wait until it is fully loaded
     page.wait_for_navigation().await?;
 
@@ -405,7 +448,7 @@ async fn generate_report(
     // If the span element is not rendered yet, capture whatever is loaded till now
     if let Err(e) = wait_for_panel_data_load(&page).await {
         log::error!(
-            "[REPORT] error occured while finding the span element for dashboard {dashboard_id}:{e}"
+            "[REPORT] error occurred while finding the span element for dashboard {dashboard_id}:{e}"
         );
     } else {
         log::info!("[REPORT] all panel data loaded for report dashboard: {dashboard_id}");
@@ -437,12 +480,14 @@ async fn generate_report(
 
     browser.close().await?;
     handle.await?;
+    log::debug!("done with headless browser");
     Ok((pdf_data, email_dashb_url))
 }
 
 async fn wait_for_panel_data_load(page: &Page) -> Result<(), anyhow::Error> {
     let start = std::time::Instant::now();
     let timeout = Duration::from_secs(CONFIG.chrome.chrome_sleep_secs.into());
+    log::info!("waiting for headless data to load");
     loop {
         if page
             .find_element("span#dashboardVariablesAndPanelsDataLoaded")

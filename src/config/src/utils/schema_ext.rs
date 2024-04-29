@@ -16,7 +16,6 @@
 use std::{
     collections::HashMap,
     hash::{Hash, Hasher},
-    sync::Arc,
 };
 
 use arrow_schema::{Field, Schema};
@@ -29,6 +28,7 @@ pub trait SchemaExt {
     fn cloned_from(&self, schema: &Schema) -> Schema;
     fn hash_key(&self) -> String;
     fn size(&self) -> usize;
+    fn simple_fields(&self) -> Vec<(String, String)>;
 }
 
 impl SchemaExt for Schema {
@@ -38,13 +38,17 @@ impl SchemaExt for Schema {
 
     // ensure schema is compatible
     fn cloned_from(&self, schema: &Schema) -> Schema {
+        let mut schema_latest_map = HashMap::with_capacity(schema.fields().len());
+        for field in schema.fields() {
+            schema_latest_map.insert(field.name(), field.clone());
+        }
         let mut fields = Vec::with_capacity(self.fields().len());
         for field in self.fields() {
-            match schema.field_with_name(field.name()) {
-                Ok(f) => {
-                    fields.push(Arc::new(f.clone()));
+            match schema_latest_map.get(field.name()) {
+                Some(f) => {
+                    fields.push(f.clone());
                 }
-                Err(_) => {
+                None => {
                     fields.push(field.clone());
                 }
             }
@@ -66,5 +70,12 @@ impl SchemaExt for Schema {
             size += key.len() + val.len();
         }
         size
+    }
+
+    fn simple_fields(&self) -> Vec<(String, String)> {
+        self.fields
+            .iter()
+            .map(|x| (x.name().to_string(), x.data_type().to_string()))
+            .collect()
     }
 }

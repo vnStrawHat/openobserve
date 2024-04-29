@@ -24,20 +24,20 @@ use std::{
 
 use arrow_schema::{DataType, Field, Schema};
 use config::{
-    meta::stream::StreamType,
+    meta::stream::{StreamPartition, StreamSettings, StreamType},
     utils::{json, schema_ext::SchemaExt},
     CONFIG,
 };
+use infra::schema::unwrap_partition_time_level;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    common::meta::stream::{SchemaRecords, StreamPartition, StreamSettings},
+    common::meta::stream::SchemaRecords,
     service::{
         db, ingestion,
         metadata::{Metadata, MetadataItem},
         stream,
-        stream::unwrap_partition_time_level,
     },
 };
 
@@ -160,7 +160,7 @@ impl TraceListIndex {
 
     async fn set_db_schema(&self, org_id: &str) -> infra::errors::Result<()> {
         // check for schema
-        let db_schema = db::schema::get(org_id, STREAM_NAME, StreamType::Metadata)
+        let db_schema = infra::schema::get(org_id, STREAM_NAME, StreamType::Metadata)
             .await
             .unwrap();
         if db_schema.fields().is_empty() {
@@ -184,6 +184,9 @@ impl TraceListIndex {
                 full_text_search_keys: vec![],
                 bloom_filter_fields: vec!["trace_id".to_string()],
                 data_retention: 0,
+                routing: None,
+                flatten_level: None,
+                defined_schema_fields: None,
             };
 
             stream::save_stream_settings(org_id, STREAM_NAME, StreamType::Metadata, settings)
@@ -201,16 +204,16 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use config::{meta::stream::StreamType, utils::json, CONFIG};
+    use infra::schema::unwrap_partition_time_level;
 
     use crate::{
         common::meta::stream::SchemaRecords,
         service::{
-            ingestion, metadata,
+            ingestion,
             metadata::{
                 trace_list_index::{TraceListIndex, TraceListItem, STREAM_NAME},
                 Metadata, MetadataItem,
             },
-            stream::unwrap_partition_time_level,
         },
     };
 
@@ -227,12 +230,12 @@ mod tests {
     async fn test_trace_list_index_write_file() {
         let t = TraceListIndex::new();
         let mut buf: HashMap<String, SchemaRecords> = HashMap::new();
-        let item = metadata::MetadataItem::TraceListIndexer(TraceListItem {
+        let item = TraceListItem {
             stream_name: "default".to_string(),
             service_name: "oojaeger".to_string(),
             trace_id: "b09e986672880927996155acd4ef113c".to_string(),
             _timestamp: 1711267573271714542,
-        });
+        };
         let schema_key = "9d384d5af30d1657";
         let timestamp = chrono::Utc::now().timestamp_micros();
         let mut data = json::to_value(item).unwrap();

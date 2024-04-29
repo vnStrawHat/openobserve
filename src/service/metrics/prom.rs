@@ -19,7 +19,10 @@ use actix_web::web;
 use chrono::{TimeZone, Utc};
 use config::{
     cluster,
-    meta::{stream::StreamType, usage::UsageType},
+    meta::{
+        stream::{PartitioningDetails, StreamType},
+        usage::UsageType,
+    },
     metrics,
     utils::{json, schema_ext::SchemaExt, time::parse_i64_to_timestamp_micros},
     FxIndexMap, CONFIG,
@@ -28,6 +31,7 @@ use datafusion::arrow::datatypes::Schema;
 use infra::{
     cache::stats,
     errors::{Error, Result},
+    schema::unwrap_partition_time_level,
 };
 use promql_parser::{label::MatchOp, parser};
 use prost::Message;
@@ -40,7 +44,7 @@ use crate::{
             alerts,
             functions::StreamTransform,
             prom::*,
-            stream::{PartitioningDetails, SchemaRecords},
+            stream::{SchemaRecords, StreamParams},
         },
     },
     service::{
@@ -49,7 +53,6 @@ use crate::{
         metrics::format_label_name,
         schema::{check_for_schema, set_schema_metadata, stream_schema_exists, SchemaCache},
         search as search_service,
-        stream::unwrap_partition_time_level,
         usage::report_request_usage_stats,
     },
 };
@@ -277,9 +280,11 @@ pub async fn remote_write(
 
             // Start get stream alerts
             crate::service::ingestion::get_stream_alerts(
-                org_id,
-                &StreamType::Metrics,
-                &metric_name,
+                &[StreamParams {
+                    org_id: org_id.to_owned().into(),
+                    stream_name: metric_name.to_owned().into(),
+                    stream_type: StreamType::Metrics,
+                }],
                 &mut stream_alerts_map,
             )
             .await;
@@ -289,7 +294,7 @@ pub async fn remote_write(
 
             // Start Register Transforms for stream
             let (local_trans, stream_vrl_map) =
-                crate::service::ingestion::register_stream_transforms(
+                crate::service::ingestion::register_stream_functions(
                     org_id,
                     &StreamType::Metrics,
                     &metric_name,
@@ -301,7 +306,7 @@ pub async fn remote_write(
             let mut value: json::Value = json::to_value(&metric).unwrap();
 
             // Start row based transform
-            value = crate::service::ingestion::apply_stream_transform(
+            value = crate::service::ingestion::apply_stream_functions(
                 &local_trans,
                 value,
                 &stream_vrl_map,
@@ -462,7 +467,7 @@ pub(crate) async fn get_metadata(org_id: &str, req: RequestMetadata) -> Result<R
     let stream_type = StreamType::Metrics;
 
     if let Some(metric_name) = req.metric {
-        let schema = db::schema::get(org_id, &metric_name, stream_type)
+        let schema = infra::schema::get(org_id, &metric_name, stream_type)
             .await
             // `db::schema::get` never fails, so it's safe to unwrap
             .unwrap();
@@ -551,7 +556,7 @@ pub(crate) async fn get_series(
         }
     };
 
-    let schema = db::schema::get(org_id, &metric_name, StreamType::Metrics)
+    let schema = infra::schema::get(org_id, &metric_name, StreamType::Metrics)
         .await
         // `db::schema::get` never fails, so it's safe to unwrap
         .unwrap();
@@ -611,6 +616,7 @@ pub(crate) async fn get_series(
         },
         aggs: HashMap::new(),
         encoding: config::meta::search::RequestEncoding::Empty,
+        clusters: vec![],
         timeout: 0,
     };
     let series = match search_service::search("", org_id, StreamType::Metrics, None, &req).await {
@@ -731,7 +737,7 @@ pub(crate) async fn get_label_values(
         }
     };
 
-    let schema = db::schema::get(org_id, &metric_name, stream_type)
+    let schema = infra::schema::get(org_id, &metric_name, stream_type)
         .await
         // `db::schema::get` never fails, so it's safe to unwrap
         .unwrap();
@@ -753,6 +759,7 @@ pub(crate) async fn get_label_values(
         },
         aggs: HashMap::new(),
         encoding: config::meta::search::RequestEncoding::Empty,
+        clusters: vec![],
         timeout: 0,
     };
     let mut label_values = match search_service::search("", org_id, stream_type, None, &req).await {

@@ -92,8 +92,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
             class="warning-msg"
             style="display: inline"
           >
-            <q-icon name="warning"
-size="xs" class="warning" />{{
+            <q-icon name="warning" size="xs" class="warning" />{{
               store.state.organizationData.quotaThresholdMsg
             }}
           </div>
@@ -183,8 +182,7 @@ size="xs" class="warning" />{{
           <q-btn-dropdown flat unelevated no-caps padding="xs sm">
             <template #label>
               <div class="row items-center no-wrap">
-                <q-avatar size="md"
-color="grey" text-color="white">
+                <q-avatar size="md" color="grey" text-color="white">
                   <img
                     :src="
                       user.picture
@@ -312,6 +310,7 @@ import {
   useLocalUserInfo,
   getImageURL,
   invlidateLoginData,
+  getLogoutURL,
 } from "../utils/zincutils";
 
 import {
@@ -406,12 +405,19 @@ export default defineComponent({
       window.open(zoBackendUrl + "/swagger/index.html", "_blank");
     },
     signout() {
-      // if (config.isEnterprise == "true") {
-      invlidateLoginData();
-      // }
+      if (config.isEnterprise == "true") {
+        invlidateLoginData();
+      }
+
+      const logoutURL = getLogoutURL();
       this.store.dispatch("logout");
+
       useLocalCurrentUser("", true);
       useLocalUserInfo("", true);
+
+      if (config.isCloud == "true") {
+        window.location.href = logoutURL;
+      }
       this.$router.push("/logout");
     },
     goToHome() {
@@ -604,9 +610,29 @@ export default defineComponent({
       },
     ];
 
-    onMounted(() => {
+    onMounted(async () => {
       miniMode.value = true;
       filterMenus();
+
+      // TODO OK : Clean get config functions which sets rum user and functions menu. Move it to common method.
+      if (
+        !store.state.zoConfig.hasOwnProperty("version") ||
+        store.state.zoConfig.version == ""
+      ) {
+        getConfig();
+      } else {
+        if (config.isCloud == "false") {
+          linksList.value = mainLayoutMixin
+            .setup()
+            .leftNavigationLinks(linksList, t);
+          filterMenus();
+        }
+        await nextTick();
+        // if rum enabled then setUser to capture session details.
+        if (store.state.zoConfig.rum?.enabled) {
+          setRumUser();
+        }
+      }
     });
 
     const selectedLanguage: any =
@@ -866,14 +892,14 @@ export default defineComponent({
 
     /**
      * Get configuration from the backend.
-     * @return {"version":"","instance":"","commit_hash":"","build_date":"","functions_enabled":true,"default_fts_keys":["field1","field2"],"telemetry_enabled":true,"default_functions":[{"name":"function name","text":"match_all('v')"}}
+     * @return {"version":"","instance":"","commit_hash":"","build_date":"","default_fts_keys":["field1","field2"],"telemetry_enabled":true,"default_functions":[{"name":"function name","text":"match_all('v')"}}
      * @throws {Error} If the request fails.
      */
     const getConfig = async () => {
       await configService
         .get_config()
         .then(async (res: any) => {
-          if (res.data.functions_enabled && config.isCloud == "false") {
+          if (config.isCloud == "false") {
             linksList.value = mainLayoutMixin
               .setup()
               .leftNavigationLinks(linksList, t);
@@ -888,8 +914,6 @@ export default defineComponent({
         })
         .catch((error) => console.log(error));
     };
-
-    getConfig();
 
     if (config.isCloud == "true") {
       mainLayoutMixin.setup().getDefaultOrganization(store);
@@ -995,8 +1019,10 @@ export default defineComponent({
         // this.setSelectedOrganization();
       }, 500);
     },
-    changeUserInfo() {
-      this.triggerRefreshToken();
+    changeUserInfo(newVal) {
+      if (JSON.stringify(newVal) != "{}") {
+        this.triggerRefreshToken();
+      }
     },
   },
 });

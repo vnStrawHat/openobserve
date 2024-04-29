@@ -34,6 +34,7 @@ pub static NO_NEED_WATCH: bool = false;
 
 static DEFAULT: OnceCell<Box<dyn Db>> = OnceCell::const_new();
 static CLUSTER_COORDINATOR: OnceCell<Box<dyn Db>> = OnceCell::const_new();
+static SUPER_CLUSTER: OnceCell<Box<dyn Db>> = OnceCell::const_new();
 
 pub async fn get_db() -> &'static Box<dyn Db> {
     DEFAULT.get_or_init(default).await
@@ -43,6 +44,10 @@ pub async fn get_coordinator() -> &'static Box<dyn Db> {
     CLUSTER_COORDINATOR
         .get_or_init(init_cluster_coordinator)
         .await
+}
+
+pub async fn get_super_cluster() -> &'static Box<dyn Db> {
+    SUPER_CLUSTER.get_or_init(init_super_cluster).await
 }
 
 pub async fn init() -> Result<()> {
@@ -78,6 +83,13 @@ async fn init_cluster_coordinator() -> Box<dyn Db> {
             _ => Box::<etcd::Etcd>::default(),
         }
     }
+}
+
+async fn init_super_cluster() -> Box<dyn Db> {
+    if CONFIG.common.local_mode {
+        panic!("super cluster is not supported in local mode");
+    }
+    Box::new(nats::NatsDb::super_cluster())
 }
 
 pub async fn create_table() -> Result<()> {
@@ -166,7 +178,7 @@ pub fn parse_key(mut key: &str) -> (String, String, String) {
         _ => {
             module = columns[0].to_string();
             key1 = columns[1].to_string();
-            key2 = columns[2..].join("/");
+            key2 = columns[2..].join("/").trim_end_matches('/').to_string();
         }
     }
     (module, key1, key2)

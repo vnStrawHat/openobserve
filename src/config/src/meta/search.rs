@@ -55,6 +55,8 @@ pub struct Request {
     #[serde(default)]
     pub encoding: RequestEncoding,
     #[serde(default)]
+    pub clusters: Vec<String>, // default query all clusters, local: only query local cluster
+    #[serde(default)]
     pub timeout: i64,
 }
 
@@ -113,6 +115,8 @@ pub struct Query {
     pub uses_zo_fn: bool,
     #[serde(default)]
     pub query_fn: Option<String>,
+    #[serde(default)]
+    pub skip_wal: bool,
 }
 
 fn default_size() -> usize {
@@ -135,6 +139,7 @@ impl Default for Query {
             query_context: None,
             uses_zo_fn: false,
             query_fn: None,
+            skip_wal: false,
         }
     }
 }
@@ -187,6 +192,7 @@ pub struct Response {
     #[serde(default)]
     #[serde(skip_serializing)]
     pub file_count: usize,
+    pub cached_ratio: usize,
     pub scan_size: usize,
     pub scan_records: usize,
     #[serde(default)]
@@ -225,6 +231,7 @@ impl Response {
             from,
             size,
             file_count: 0,
+            cached_ratio: 0,
             scan_size: 0,
             scan_records: 0,
             columns: Vec::new(),
@@ -274,6 +281,10 @@ impl Response {
         self.file_count = val;
     }
 
+    pub fn set_cached_ratio(&mut self, val: usize) {
+        self.cached_ratio = val;
+    }
+
     pub fn set_scan_size(&mut self, val: usize) {
         self.scan_size = val;
     }
@@ -307,12 +318,12 @@ pub struct SearchPartitionResponse {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, ToSchema)]
-pub struct JobStatusResponse {
-    pub status: Vec<JobStatus>,
+pub struct QueryStatusResponse {
+    pub status: Vec<QueryStatus>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, ToSchema)]
-pub struct JobStatus {
+pub struct QueryStatus {
     pub trace_id: String,
     pub status: String,
     pub created_at: i64,
@@ -332,7 +343,7 @@ pub struct QueryInfo {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, ToSchema)]
-pub struct CancelJobResponse {
+pub struct CancelQueryResponse {
     pub trace_id: String,
     pub is_success: bool,
 }
@@ -343,6 +354,9 @@ pub struct ScanStats {
     pub records: i64,
     pub original_size: i64,
     pub compressed_size: i64,
+    pub querier_files: i64,
+    pub querier_memory_cached_files: i64,
+    pub querier_disk_cached_files: i64,
 }
 
 impl ScanStats {
@@ -355,6 +369,9 @@ impl ScanStats {
         self.records += other.records;
         self.original_size += other.original_size;
         self.compressed_size += other.compressed_size;
+        self.querier_files += other.querier_files;
+        self.querier_memory_cached_files += other.querier_memory_cached_files;
+        self.querier_disk_cached_files += other.querier_disk_cached_files;
     }
 
     pub fn format_to_mb(&mut self) {
@@ -379,6 +396,7 @@ impl From<Request> for cluster_rpc::SearchRequest {
             query_context: req.query.query_context.unwrap_or_default(),
             uses_zo_fn: req.query.uses_zo_fn,
             query_fn: req.query.query_fn.unwrap_or_default(),
+            skip_wal: req.query.skip_wal,
         };
 
         let job = cluster_rpc::Job {
@@ -414,6 +432,9 @@ impl From<&ScanStats> for cluster_rpc::ScanStats {
             records: req.records,
             original_size: req.original_size,
             compressed_size: req.compressed_size,
+            querier_files: req.querier_files,
+            querier_memory_cached_files: req.querier_memory_cached_files,
+            querier_disk_cached_files: req.querier_disk_cached_files,
         }
     }
 }
@@ -425,6 +446,9 @@ impl From<&cluster_rpc::ScanStats> for ScanStats {
             records: req.records,
             original_size: req.original_size,
             compressed_size: req.compressed_size,
+            querier_files: req.querier_files,
+            querier_memory_cached_files: req.querier_memory_cached_files,
+            querier_disk_cached_files: req.querier_disk_cached_files,
         }
     }
 }
@@ -513,9 +537,11 @@ mod tests {
                 query_context: None,
                 uses_zo_fn: false,
                 query_fn: None,
+                skip_wal: false,
             },
             aggs: HashMap::new(),
             encoding: "base64".into(),
+            clusters: vec![],
             timeout: 0,
         };
         req.aggs

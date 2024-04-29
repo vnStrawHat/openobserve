@@ -55,17 +55,17 @@ pub mod templates;
 
 pub async fn save(
     org_id: &str,
-    stream_type: StreamType,
     stream_name: &str,
     name: &str,
     mut alert: Alert,
     create: bool,
 ) -> Result<(), anyhow::Error> {
     if !name.is_empty() {
-        alert.name = name.trim().to_string();
+        alert.name = name.to_string();
     }
+    alert.name = alert.name.trim().to_string();
     alert.org_id = org_id.to_string();
-    alert.stream_type = stream_type;
+    let stream_type = alert.stream_type;
     alert.stream_name = stream_name.to_string();
     alert.row_template = alert.row_template.trim().to_string();
 
@@ -123,7 +123,7 @@ pub async fn save(
     }
 
     // before saving alert check column type to decide numeric condition
-    let schema = db::schema::get(org_id, stream_name, stream_type).await?;
+    let schema = infra::schema::get(org_id, stream_name, stream_type).await?;
     if stream_name.is_empty() || schema.fields().is_empty() {
         return Err(anyhow::anyhow!("Stream {stream_name} not found"));
     }
@@ -203,7 +203,7 @@ pub async fn list(
                     || permitted
                         .as_ref()
                         .unwrap()
-                        .contains(&format!("alert:{}", org_id))
+                        .contains(&format!("alert:_all_{}", org_id))
                 {
                     result.push(alert);
                 }
@@ -457,9 +457,11 @@ impl QueryCondition {
                 uses_zo_fn: false,
                 query_context: None,
                 query_fn: None,
+                skip_wal: false,
             },
             aggs: HashMap::new(),
             encoding: config::meta::search::RequestEncoding::Empty,
+            clusters: vec![],
             timeout: 0,
         };
         let trace_id = ider::uuid();
@@ -552,7 +554,7 @@ impl Condition {
 }
 
 async fn build_sql(alert: &Alert, conditions: &[Condition]) -> Result<String, anyhow::Error> {
-    let schema = db::schema::get(&alert.org_id, &alert.stream_name, alert.stream_type).await?;
+    let schema = infra::schema::get(&alert.org_id, &alert.stream_name, alert.stream_type).await?;
     let mut wheres = Vec::with_capacity(conditions.len());
     for cond in conditions.iter() {
         let data_type = match schema.field_with_name(&cond.column) {
@@ -879,6 +881,10 @@ pub async fn send_email_notification(
         email = email.to(recepient.parse()?);
     }
 
+    if !CONFIG.smtp.smtp_reply_to.is_empty() {
+        email = email.reply_to(CONFIG.smtp.smtp_reply_to.parse()?);
+    }
+
     let email = email.singlepart(SinglePart::html(msg)).unwrap();
 
     // Send the email
@@ -971,6 +977,12 @@ fn process_row_template(tpl: &String, alert: &Alert, rows: &[Map<String, Value>]
             .replace("{alert_count}", &alert_count.to_string())
             .replace("{alert_start_time}", &alert_start_time_str)
             .replace("{alert_end_time}", &alert_end_time_str);
+
+        if let Some(contidion) = &alert.query_condition.promql_condition {
+            resp = resp
+                .replace("{alert_promql_operator}", &contidion.operator.to_string())
+                .replace("{alert_promql_value}", &contidion.value.to_string());
+        }
 
         if let Some(attrs) = &alert.context_attributes {
             for (key, value) in attrs.iter() {
@@ -1108,10 +1120,11 @@ async fn process_dest_template(
         }
         // http://localhost:5080/web/metrics?stream=zo_http_response_time_bucket&from=1705248000000000&to=1705334340000000&query=em9faHR0cF9yZXNwb25zZV90aW1lX2J1Y2tldHt9&org_identifier=default
         format!(
-            "{}{}/web/metrics?stream_type={}&stream={}&from={}&to={}&query={}&org_identifier={}",
+            "{}{}/web/metrics?stream_type={}&stream={}&stream_value={}&from={}&to={}&query={}&org_identifier={}",
             CONFIG.common.web_url,
             CONFIG.common.base_uri,
             alert.stream_type,
+            alert.stream_name,
             alert.stream_name,
             alert_start_time,
             alert_end_time,
@@ -1136,10 +1149,11 @@ async fn process_dest_template(
         };
         // http://localhost:5080/web/logs?stream_type=logs&stream=test&from=1708416534519324&to=1708416597898186&sql_mode=true&query=U0VMRUNUICogRlJPTSAidGVzdCIgd2hlcmUgbGV2ZWwgPSAnaW5mbyc=&org_identifier=default
         format!(
-            "{}{}/web/logs?stream_type={}&stream={}&from={}&to={}&sql_mode=true&query={}&org_identifier={}",
+            "{}{}/web/logs?stream_type={}&stream={}&stream_value={}&from={}&to={}&sql_mode=true&query={}&org_identifier={}",
             CONFIG.common.web_url,
             CONFIG.common.base_uri,
             alert.stream_type,
+            alert.stream_name,
             alert.stream_name,
             alert_start_time,
             alert_end_time,
@@ -1170,6 +1184,13 @@ async fn process_dest_template(
         .replace("{alert_start_time}", &alert_start_time_str)
         .replace("{alert_end_time}", &alert_end_time_str)
         .replace("{alert_url}", &alert_url);
+
+    if let Some(contidion) = &alert.query_condition.promql_condition {
+        resp = resp
+            .replace("{alert_promql_operator}", &contidion.operator.to_string())
+            .replace("{alert_promql_value}", &contidion.value.to_string());
+    }
+
     process_variable_replace(&mut resp, "rows", &VarValue::Vector(rows_tpl_val));
     for (key, value) in vars.iter() {
         if resp.contains(&format!("{{{key}}}")) {
@@ -1255,14 +1276,13 @@ mod tests {
     #[tokio::test]
     async fn test_alert_create() {
         let org_id = "default";
-        let stream_type = StreamType::Logs;
         let stream_name = "default";
         let alert_name = "abc/alert";
         let alert = Alert {
             name: alert_name.to_string(),
             ..Default::default()
         };
-        let ret = save(org_id, stream_type, stream_name, alert_name, alert, true).await;
+        let ret = save(org_id, stream_name, alert_name, alert, true).await;
         // alert name should not contain /
         assert!(ret.is_err());
     }

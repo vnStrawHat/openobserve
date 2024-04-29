@@ -21,7 +21,7 @@ use config::{
         stream::StreamType,
         usage::{
             AggregatedData, GroupKey, RequestStats, TriggerData, UsageData, UsageEvent, UsageType,
-            STATS_STREAM, TRIGGERS_USAGE_STREAM, USAGE_STREAM,
+            TRIGGERS_USAGE_STREAM, USAGE_STREAM,
         },
     },
     metrics,
@@ -29,6 +29,8 @@ use config::{
     CONFIG, SIZE_IN_MB,
 };
 use hashbrown::HashMap;
+#[cfg(feature = "enterprise")]
+use o2_enterprise::enterprise::common::auditor;
 use once_cell::sync::Lazy;
 use proto::cluster_rpc;
 use reqwest::Client;
@@ -93,11 +95,12 @@ pub async fn report_request_usage_stats(
             stream_name: stream_name.to_owned(),
             min_ts: None,
             max_ts: None,
+            cached_ratio: None,
             compressed_size: None,
         });
     };
 
-    if !CONFIG.common.usage_report_compressed_size || event != UsageEvent::Ingestion {
+    if event != UsageEvent::Ingestion {
         usage.push(UsageData {
             event,
             day: now.day(),
@@ -122,56 +125,10 @@ pub async fn report_request_usage_stats(
             stream_name: stream_name.to_owned(),
             min_ts: stats.min_ts,
             max_ts: stats.max_ts,
+            cached_ratio: stats.cached_ratio,
             compressed_size: None,
         });
     };
-    if !usage.is_empty() {
-        publish_usage(usage).await;
-    }
-}
-
-pub async fn report_compression_stats(
-    stats: RequestStats,
-    org_id: &str,
-    stream_name: &str,
-    stream_type: StreamType,
-) {
-    if !CONFIG.common.usage_enabled || !CONFIG.common.usage_report_compressed_size {
-        return;
-    }
-    if CONFIG.common.usage_org.eq(org_id)
-        && (stream_name.eq(STATS_STREAM) || stream_name.eq(USAGE_STREAM))
-    {
-        return;
-    }
-    let now = Utc::now();
-    let usage = vec![UsageData {
-        event: UsageEvent::Ingestion,
-        year: now.year(),
-        month: now.month(),
-        day: now.day(),
-        hour: now.hour(),
-        event_time_hour: format!(
-            "{:04}{:02}{:02}{:02}",
-            now.year(),
-            now.month(),
-            now.day(),
-            now.hour()
-        ),
-        org_id: org_id.to_owned(),
-        request_body: "".to_owned(),
-        size: stats.size,
-        unit: "MB".to_owned(),
-        user_email: "".to_owned(),
-        response_time: 0.0,
-        num_records: stats.records,
-        stream_type,
-        stream_name: stream_name.to_owned(),
-        min_ts: stats.min_ts,
-        max_ts: stats.max_ts,
-        compressed_size: stats.compressed_size,
-    }];
-
     if !usage.is_empty() {
         publish_usage(usage).await;
     }
@@ -188,24 +145,79 @@ pub async fn publish_usage(mut usage: Vec<UsageData>) {
     // release the write lock
     drop(usages);
 
+    ingest_usages(curr_usages).await
+}
+
+pub async fn publish_triggers_usage(trigger: TriggerData) {
+    if !CONFIG.common.usage_enabled {
+        return;
+    }
+
+    let mut usages = TRIGGERS_USAGE_DATA.write().await;
+    usages.push(trigger);
+    if usages.len() < CONFIG.common.usage_batch_size {
+        return;
+    }
+
+    let curr_usages = std::mem::take(&mut *usages);
+    // release the write lock
+    drop(usages);
+
+    ingest_trigger_usages(curr_usages).await
+}
+
+pub async fn flush() {
+    // flush audit data
+    #[cfg(feature = "enterprise")]
+    flush_audit().await;
+
+    // flush usage report
+    flush_usage().await;
+    // flush triggers usage report
+    flush_triggers_usage().await;
+}
+
+async fn flush_usage() {
+    if !CONFIG.common.usage_enabled {
+        return;
+    }
+
+    let mut usages = USAGE_DATA.write().await;
+    if usages.len() == 0 {
+        return;
+    }
+
+    let curr_usages = std::mem::take(&mut *usages);
+    // release the write lock
+    drop(usages);
+
+    ingest_usages(curr_usages).await
+}
+
+async fn flush_triggers_usage() {
+    if !CONFIG.common.usage_enabled {
+        return;
+    }
+
+    let mut usages = TRIGGERS_USAGE_DATA.write().await;
+    if usages.len() == 0 {
+        return;
+    }
+
+    let curr_usages = std::mem::take(&mut *usages);
+    // release the write lock
+    drop(usages);
+
+    ingest_trigger_usages(curr_usages).await
+}
+
+async fn ingest_usages(curr_usages: Vec<UsageData>) {
     let mut groups: HashMap<GroupKey, AggregatedData> = HashMap::new();
+    let mut search_events = vec![];
     for usage_data in &curr_usages {
         // Skip aggregation for usage_data with event "Search"
         if usage_data.event == UsageEvent::Search {
-            let key = GroupKey {
-                stream_name: usage_data.stream_name.clone(),
-                org_id: usage_data.org_id.clone(),
-                stream_type: usage_data.stream_type,
-                day: usage_data.day,
-                hour: usage_data.hour,
-                event: usage_data.event,
-                email: usage_data.user_email.clone(),
-            };
-
-            groups.entry(key).or_insert_with(|| AggregatedData {
-                count: 1,
-                usage_data: usage_data.clone(),
-            });
+            search_events.push(usage_data.clone());
             continue;
         }
 
@@ -241,6 +253,9 @@ pub async fn publish_usage(mut usage: Vec<UsageData>) {
         usage_data.response_time /= data.count as f64;
         report_data.push(usage_data);
     }
+
+    // Push all the search events
+    report_data.append(&mut search_events);
 
     if &CONFIG.common.usage_reporting_mode != "local"
         && !CONFIG.common.usage_reporting_url.is_empty()
@@ -290,17 +305,7 @@ pub async fn publish_usage(mut usage: Vec<UsageData>) {
     }
 }
 
-pub async fn publish_triggers_usage(trigger: TriggerData) {
-    let mut usages = TRIGGERS_USAGE_DATA.write().await;
-    usages.push(trigger);
-    if usages.len() < CONFIG.common.usage_batch_size {
-        return;
-    }
-
-    let curr_usages = std::mem::take(&mut *usages);
-    // release the write lock
-    drop(usages);
-
+async fn ingest_trigger_usages(curr_usages: Vec<TriggerData>) {
     let mut json_triggers = vec![];
     for trigger_data in &curr_usages {
         json_triggers.push(json::to_value(trigger_data).unwrap());
@@ -319,4 +324,21 @@ pub async fn publish_triggers_usage(trigger: TriggerData) {
         usages.append(&mut curr_usages);
         drop(usages);
     }
+}
+
+#[cfg(feature = "enterprise")]
+pub async fn audit(msg: auditor::AuditMessage) {
+    auditor::audit(msg, publish_audit).await;
+}
+
+#[cfg(feature = "enterprise")]
+pub async fn flush_audit() {
+    auditor::flush_audit(publish_audit).await;
+}
+
+#[cfg(feature = "enterprise")]
+async fn publish_audit(
+    req: cluster_rpc::UsageRequest,
+) -> Result<cluster_rpc::UsageResponse, anyhow::Error> {
+    ingestion_service::ingest(&CONFIG.common.usage_org, req).await
 }

@@ -1,4 +1,4 @@
-// Copyright 2023 Zinc Labs Inc.
+// Copyright 2024 Zinc Labs Inc.
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -42,9 +42,7 @@ use crate::{
     handler::http::request::CONTENT_TYPE_JSON,
     service::{
         db, get_formatted_stream_name,
-        ingestion::{
-            evaluate_trigger, get_int_value, get_val_for_attr, write_file, TriggerAlertData,
-        },
+        ingestion::{evaluate_trigger, get_val_for_attr, write_file, TriggerAlertData},
         metadata::{distinct_values::DvItem, write, MetadataItem, MetadataType},
         schema::{get_upto_discard_error, stream_schema_exists, SchemaCache},
         usage::report_request_usage_stats,
@@ -160,16 +158,18 @@ pub async fn logs_json_handler(
 
     // Start get stream alerts
     crate::service::ingestion::get_stream_alerts(
-        org_id,
-        &StreamType::Logs,
-        stream_name,
+        &[StreamParams {
+            org_id: org_id.to_owned().into(),
+            stream_name: stream_name.to_owned().into(),
+            stream_type: StreamType::Logs,
+        }],
         &mut stream_alerts_map,
     )
     .await;
     // End get stream alert
 
     // Start Register Transforms for stream
-    let (local_trans, stream_vrl_map) = crate::service::ingestion::register_stream_transforms(
+    let (local_trans, stream_vrl_map) = crate::service::ingestion::register_stream_functions(
         org_id,
         &StreamType::Logs,
         stream_name,
@@ -265,9 +265,9 @@ pub async fn logs_json_handler(
 
             for log in log_records {
                 let start_time: i64 = if log.get("timeUnixNano").is_some() {
-                    get_int_value(log.get("timeUnixNano").unwrap())
+                    json::get_int_value(log.get("timeUnixNano").unwrap())
                 } else {
-                    get_int_value(log.get("time_unix_nano").unwrap())
+                    json::get_int_value(log.get("time_unix_nano").unwrap())
                 };
 
                 let timestamp = if start_time > 0 {
@@ -352,10 +352,11 @@ pub async fn logs_json_handler(
                 value = json::to_value(local_val)?;
 
                 // JSON Flattening
-                value = flatten::flatten(value).unwrap();
+                value =
+                    flatten::flatten_with_level(value, CONFIG.limit.ingest_flatten_level).unwrap();
 
                 if !local_trans.is_empty() {
-                    value = crate::service::ingestion::apply_stream_transform(
+                    value = crate::service::ingestion::apply_stream_functions(
                         &local_trans,
                         value,
                         &stream_vrl_map,

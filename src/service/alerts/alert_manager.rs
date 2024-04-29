@@ -24,7 +24,6 @@ use config::{
     CONFIG,
 };
 use cron::Schedule;
-use infra::scheduler;
 
 use crate::{
     common::meta::{alerts::AlertFrequencyType, dashboards::reports::ReportFrequencyType},
@@ -32,16 +31,19 @@ use crate::{
 };
 
 pub async fn run() -> Result<(), anyhow::Error> {
+    log::debug!("Pulling jobs from scheduler");
     // Scheduler pulls only those triggers that match the conditions-
     // - trigger.next_run_at <= now
     // - !(trigger.is_realtime && !trigger.is_silenced)
     // - trigger.status == "Waiting"
-    let triggers = scheduler::pull(
+    let triggers = db::scheduler::pull(
         CONFIG.limit.alert_schedule_concurrency,
         CONFIG.limit.alert_schedule_timeout,
         CONFIG.limit.report_schedule_timeout,
     )
     .await?;
+
+    log::debug!("Pulled {} jobs from scheduler", triggers.len());
 
     for trigger in triggers {
         tokio::task::spawn(async move {
@@ -53,14 +55,18 @@ pub async fn run() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-pub async fn handle_triggers(trigger: scheduler::Trigger) -> Result<(), anyhow::Error> {
+pub async fn handle_triggers(trigger: db::scheduler::Trigger) -> Result<(), anyhow::Error> {
     match trigger.module {
-        scheduler::TriggerModule::Report => handle_report_triggers(trigger).await,
-        scheduler::TriggerModule::Alert => handle_alert_triggers(trigger).await,
+        db::scheduler::TriggerModule::Report => handle_report_triggers(trigger).await,
+        db::scheduler::TriggerModule::Alert => handle_alert_triggers(trigger).await,
     }
 }
 
-async fn handle_alert_triggers(trigger: scheduler::Trigger) -> Result<(), anyhow::Error> {
+async fn handle_alert_triggers(trigger: db::scheduler::Trigger) -> Result<(), anyhow::Error> {
+    log::debug!(
+        "Inside handle_alert_triggers: processing trigger: {}",
+        &trigger.module_key
+    );
     let columns = trigger.module_key.split('/').collect::<Vec<&str>>();
     assert_eq!(columns.len(), 3);
     let org_id = &trigger.org;
@@ -72,14 +78,14 @@ async fn handle_alert_triggers(trigger: scheduler::Trigger) -> Result<(), anyhow
 
     if is_realtime && is_silenced {
         // wakeup the trigger
-        let new_trigger = scheduler::Trigger {
+        let new_trigger = db::scheduler::Trigger {
             next_run_at: Utc::now().timestamp_micros(),
             is_realtime: true,
             is_silenced: false,
-            status: scheduler::TriggerStatus::Waiting,
+            status: db::scheduler::TriggerStatus::Waiting,
             ..trigger.clone()
         };
-        scheduler::update_trigger(new_trigger).await?;
+        db::scheduler::update_trigger(new_trigger).await?;
         return Ok(());
     }
 
@@ -96,11 +102,11 @@ async fn handle_alert_triggers(trigger: scheduler::Trigger) -> Result<(), anyhow
         }
     };
 
-    let mut new_trigger = scheduler::Trigger {
+    let mut new_trigger = db::scheduler::Trigger {
         next_run_at: Utc::now().timestamp_micros(),
         is_realtime: false,
         is_silenced: false,
-        status: scheduler::TriggerStatus::Waiting,
+        status: db::scheduler::TriggerStatus::Waiting,
         retries: 0,
         ..trigger.clone()
     };
@@ -109,7 +115,7 @@ async fn handle_alert_triggers(trigger: scheduler::Trigger) -> Result<(), anyhow
         // update trigger, check on next week
         new_trigger.next_run_at += Duration::try_days(7).unwrap().num_microseconds().unwrap();
         new_trigger.is_silenced = true;
-        scheduler::update_trigger(new_trigger).await?;
+        db::scheduler::update_trigger(new_trigger).await?;
         return Ok(());
     }
 
@@ -145,8 +151,8 @@ async fn handle_alert_triggers(trigger: scheduler::Trigger) -> Result<(), anyhow
         is_realtime: trigger.is_realtime,
         is_silenced: trigger.is_silenced,
         status: TriggerDataStatus::Completed,
-        start_time: trigger.start_time,
-        end_time: trigger.end_time,
+        start_time: trigger.start_time.unwrap_or_default(),
+        end_time: trigger.end_time.unwrap_or_default(),
         retries: trigger.retries,
         error: None,
     };
@@ -155,24 +161,46 @@ async fn handle_alert_triggers(trigger: scheduler::Trigger) -> Result<(), anyhow
     if let Some(data) = ret {
         match alert.send_notification(&data).await {
             Ok(_) => {
-                scheduler::update_trigger(new_trigger).await?;
+                db::scheduler::update_trigger(new_trigger).await?;
             }
             Err(e) => {
-                scheduler::update_status(
+                log::error!(
+                    "Error sending alert notification: org: {}, module_key: {}",
                     &new_trigger.org,
-                    new_trigger.module,
-                    &new_trigger.module_key,
-                    scheduler::TriggerStatus::Waiting,
-                    trigger.retries + 1,
-                )
-                .await?;
+                    &new_trigger.module_key
+                );
+                if trigger.retries + 1 >= CONFIG.limit.scheduler_max_retries {
+                    // It has been tried the maximum time, just update the
+                    // next_run_at to the next expected trigger time
+                    log::debug!(
+                        "This alert trigger: {}/{} has reached maximum retries",
+                        &new_trigger.org,
+                        &new_trigger.module_key
+                    );
+                    db::scheduler::update_trigger(new_trigger).await?;
+                } else {
+                    // Otherwise update its status only
+                    db::scheduler::update_status(
+                        &new_trigger.org,
+                        new_trigger.module,
+                        &new_trigger.module_key,
+                        db::scheduler::TriggerStatus::Waiting,
+                        trigger.retries + 1,
+                    )
+                    .await?;
+                }
                 trigger_data_stream.status = TriggerDataStatus::Failed;
                 trigger_data_stream.error =
                     Some(format!("error sending notification for alert: {e}"));
             }
         }
     } else {
-        scheduler::update_trigger(new_trigger).await?;
+        log::debug!(
+            "Alert conditions not satisfied, org: {}, module_key: {}",
+            &new_trigger.org,
+            &new_trigger.module_key
+        );
+        db::scheduler::update_trigger(new_trigger).await?;
         trigger_data_stream.status = TriggerDataStatus::ConditionNotSatisfied;
     }
 
@@ -183,25 +211,35 @@ async fn handle_alert_triggers(trigger: scheduler::Trigger) -> Result<(), anyhow
     Ok(())
 }
 
-async fn handle_report_triggers(trigger: scheduler::Trigger) -> Result<(), anyhow::Error> {
+async fn handle_report_triggers(trigger: db::scheduler::Trigger) -> Result<(), anyhow::Error> {
+    log::debug!(
+        "Inside handle_report_trigger,org: {}, module_key: {}",
+        &trigger.org,
+        &trigger.module_key
+    );
     let org_id = &trigger.org;
     // For report, trigger.module_key is the report name
     let report_name = &trigger.module_key;
 
     let mut report = db::dashboards::reports::get(org_id, report_name).await?;
-    let mut new_trigger = scheduler::Trigger {
+    let mut new_trigger = db::scheduler::Trigger {
         next_run_at: Utc::now().timestamp_micros(),
         is_realtime: false,
         is_silenced: false,
-        status: scheduler::TriggerStatus::Waiting,
+        status: db::scheduler::TriggerStatus::Waiting,
         retries: 0,
         ..trigger.clone()
     };
 
     if !report.enabled {
+        log::debug!(
+            "Report not enabled: org: {}, report: {}",
+            org_id,
+            report_name
+        );
         // update trigger, check on next week
         new_trigger.next_run_at += Duration::try_days(7).unwrap().num_microseconds().unwrap();
-        scheduler::update_trigger(new_trigger).await?;
+        db::scheduler::update_trigger(new_trigger).await?;
         return Ok(());
     }
     let mut run_once = false;
@@ -261,8 +299,8 @@ async fn handle_report_triggers(trigger: scheduler::Trigger) -> Result<(), anyho
         is_realtime: trigger.is_realtime,
         is_silenced: trigger.is_silenced,
         status: TriggerDataStatus::Completed,
-        start_time: trigger.start_time,
-        end_time: trigger.end_time,
+        start_time: trigger.start_time.unwrap_or_default(),
+        end_time: trigger.end_time.unwrap_or_default(),
         retries: trigger.retries,
         error: None,
     };
@@ -270,22 +308,35 @@ async fn handle_report_triggers(trigger: scheduler::Trigger) -> Result<(), anyho
     let now = Utc::now().timestamp_micros();
     match report.send_subscribers().await {
         Ok(_) => {
+            log::debug!("Report send_subscribers done, report: {}", report_name);
             // Report generation successful, update the trigger
             if run_once {
-                new_trigger.status = scheduler::TriggerStatus::Completed;
+                new_trigger.status = db::scheduler::TriggerStatus::Completed;
             }
-            scheduler::update_trigger(new_trigger).await?;
+            db::scheduler::update_trigger(new_trigger).await?;
+            log::debug!("Update trigger for report: {}", report_name);
             trigger_data_stream.end_time = Utc::now().timestamp_micros();
         }
         Err(e) => {
-            scheduler::update_status(
-                &new_trigger.org,
-                new_trigger.module,
-                &new_trigger.module_key,
-                scheduler::TriggerStatus::Waiting,
-                trigger.retries + 1,
-            )
-            .await?;
+            log::error!("Error sending report to subscribers: {e}");
+            if trigger.retries + 1 >= CONFIG.limit.scheduler_max_retries && !run_once {
+                // It has been tried the maximum time, just update the
+                // next_run_at to the next expected trigger time
+                log::debug!(
+                    "This report trigger: {org_id}/{report_name} has reached maximum possible retries"
+                );
+                db::scheduler::update_trigger(new_trigger).await?;
+            } else {
+                // Otherwise update its status only
+                db::scheduler::update_status(
+                    &new_trigger.org,
+                    new_trigger.module,
+                    &new_trigger.module_key,
+                    db::scheduler::TriggerStatus::Waiting,
+                    trigger.retries + 1,
+                )
+                .await?;
+            }
             trigger_data_stream.end_time = Utc::now().timestamp_micros();
             trigger_data_stream.status = TriggerDataStatus::Failed;
             trigger_data_stream.error = Some(format!("error processing report: {e}"));

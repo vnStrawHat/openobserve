@@ -13,16 +13,24 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::cmp::max;
+use std::{cmp::max, fmt::Display};
 
 use byteorder::{ByteOrder, LittleEndian};
 use chrono::Duration;
+use hashbrown::HashMap;
 use proto::cluster_rpc;
-use serde::{Deserialize, Serialize};
+use serde::{ser::SerializeStruct, Deserialize, Serialize, Serializer};
 use utoipa::ToSchema;
 
 use super::usage::Stats;
-use crate::{utils::json, CONFIG};
+use crate::{
+    utils::{
+        hash::{gxhash, Sum64},
+        json,
+        json::{Map, Value},
+    },
+    CONFIG,
+};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, ToSchema, Hash)]
 #[serde(rename_all = "lowercase")]
@@ -389,6 +397,356 @@ impl std::fmt::Display for PartitionTimeLevel {
     }
 }
 
+#[derive(Clone, Debug, Default, Deserialize, ToSchema)]
+pub struct StreamSettings {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
+    pub partition_keys: Vec<StreamPartition>,
+    #[serde(skip_serializing_if = "Option::None")]
+    pub partition_time_level: Option<PartitionTimeLevel>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
+    pub full_text_search_keys: Vec<String>,
+    #[serde(default)]
+    pub bloom_filter_fields: Vec<String>,
+    #[serde(default)]
+    pub data_retention: i64,
+    #[serde(skip_serializing_if = "Option::None")]
+    pub routing: Option<HashMap<String, Vec<RoutingCondition>>>,
+    #[serde(skip_serializing_if = "Option::None")]
+    pub flatten_level: Option<i64>,
+    #[serde(skip_serializing_if = "Option::None")]
+    pub defined_schema_fields: Option<Vec<String>>,
+}
+
+impl Serialize for StreamSettings {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("stream_settings", 4)?;
+        let mut part_keys = HashMap::new();
+        for (index, key) in self.partition_keys.iter().enumerate() {
+            part_keys.insert(format!("L{index}"), key);
+        }
+        state.serialize_field("partition_keys", &part_keys)?;
+        state.serialize_field(
+            "partition_time_level",
+            &self.partition_time_level.unwrap_or_default(),
+        )?;
+        state.serialize_field("full_text_search_keys", &self.full_text_search_keys)?;
+        state.serialize_field("bloom_filter_fields", &self.bloom_filter_fields)?;
+        state.serialize_field("data_retention", &self.data_retention)?;
+        match self.routing.as_ref() {
+            Some(routing) => {
+                state.serialize_field("routing", routing)?;
+            }
+            None => {
+                state.skip_field("routing")?;
+            }
+        }
+        match self.defined_schema_fields.as_ref() {
+            Some(fields) => {
+                if !fields.is_empty() {
+                    state.serialize_field("defined_schema_fields", fields)?;
+                } else {
+                    state.skip_field("defined_schema_fields")?;
+                }
+            }
+            None => {
+                state.skip_field("defined_schema_fields")?;
+            }
+        }
+        match self.flatten_level.as_ref() {
+            Some(flatten_level) => {
+                state.serialize_field("flatten_level", flatten_level)?;
+            }
+            None => {
+                state.skip_field("flatten_level")?;
+            }
+        }
+        state.end()
+    }
+}
+
+impl From<&str> for StreamSettings {
+    fn from(data: &str) -> Self {
+        let settings: json::Value = json::from_slice(data.as_bytes()).unwrap();
+
+        let mut partition_keys = Vec::new();
+        if let Some(value) = settings.get("partition_keys") {
+            let mut v: Vec<_> = value.as_object().unwrap().into_iter().collect();
+            v.sort_by(|a, b| a.0.cmp(b.0));
+            for (_, value) in v.iter() {
+                match value {
+                    json::Value::String(v) => {
+                        partition_keys.push(StreamPartition::new(v));
+                    }
+                    json::Value::Object(v) => {
+                        let val: StreamPartition =
+                            json::from_value(json::Value::Object(v.to_owned())).unwrap();
+                        partition_keys.push(val);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let mut partition_time_level = None;
+        if let Some(value) = settings.get("partition_time_level") {
+            partition_time_level = Some(PartitionTimeLevel::from(value.as_str().unwrap()));
+        }
+
+        let mut full_text_search_keys = Vec::new();
+        let fts = settings.get("full_text_search_keys");
+        if let Some(value) = fts {
+            let v: Vec<_> = value.as_array().unwrap().iter().collect();
+            for item in v {
+                full_text_search_keys.push(item.as_str().unwrap().to_string())
+            }
+        }
+
+        let mut bloom_filter_fields = Vec::new();
+        let fts = settings.get("bloom_filter_fields");
+        if let Some(value) = fts {
+            let v: Vec<_> = value.as_array().unwrap().iter().collect();
+            for item in v {
+                bloom_filter_fields.push(item.as_str().unwrap().to_string())
+            }
+        }
+
+        let mut data_retention = 0;
+        if let Some(v) = settings.get("data_retention") {
+            data_retention = v.as_i64().unwrap();
+        };
+
+        let mut defined_schema_fields: Option<Vec<String>> = None;
+        if let Some(value) = settings.get("defined_schema_fields") {
+            let fields = value
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item.as_str().unwrap().to_string())
+                .collect::<Vec<_>>();
+            if !fields.is_empty() {
+                defined_schema_fields = Some(fields);
+            }
+        }
+
+        let mut routing: HashMap<String, Vec<RoutingCondition>> = HashMap::new();
+        let routes = settings.get("routing");
+        if let Some(value) = routes {
+            let v: Vec<_> = value.as_object().unwrap().iter().collect();
+            for item in v {
+                routing.insert(
+                    item.0.to_string(),
+                    json::from_value(item.1.clone()).unwrap(),
+                );
+            }
+        }
+
+        let flatten_level = settings.get("flatten_level").map(|v| v.as_i64().unwrap());
+
+        Self {
+            partition_keys,
+            partition_time_level,
+            full_text_search_keys,
+            bloom_filter_fields,
+            data_retention,
+            routing: Some(routing),
+            flatten_level,
+            defined_schema_fields,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct StreamPartition {
+    pub field: String,
+    #[serde(default)]
+    pub types: StreamPartitionType,
+    #[serde(default)]
+    pub disabled: bool,
+}
+
+impl StreamPartition {
+    pub fn new(field: &str) -> Self {
+        Self {
+            field: field.to_string(),
+            types: StreamPartitionType::Value,
+            disabled: false,
+        }
+    }
+
+    pub fn new_hash(field: &str, buckets: u64) -> Self {
+        Self {
+            field: field.to_string(),
+            types: StreamPartitionType::Hash(std::cmp::max(16, buckets)),
+            disabled: false,
+        }
+    }
+
+    pub fn get_partition_key(&self, value: &str) -> String {
+        format!("{}={}", self.field, self.get_partition_value(value))
+    }
+
+    pub fn get_partition_value(&self, value: &str) -> String {
+        match &self.types {
+            StreamPartitionType::Value => value.to_string(),
+            StreamPartitionType::Hash(n) => {
+                let h = gxhash::new().sum64(value);
+                let bucket = h % n;
+                bucket.to_string()
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum StreamPartitionType {
+    #[default]
+    Value, // each value is a partition
+    Hash(u64), // partition with fixed bucket size by hash
+}
+
+impl Display for StreamPartitionType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StreamPartitionType::Value => write!(f, "value"),
+            StreamPartitionType::Hash(_) => write!(f, "hash"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub struct PartitioningDetails {
+    pub partition_keys: Vec<StreamPartition>,
+    pub partition_time_level: Option<PartitionTimeLevel>,
+}
+
+pub struct Routing {
+    pub destination: String,
+    pub routing: Vec<RoutingCondition>,
+}
+
+// Code Duplicated from alerts
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RoutingCondition {
+    pub column: String,
+    pub operator: Operator,
+    #[schema(value_type = Object)]
+    pub value: Value,
+    #[serde(default)]
+    pub ignore_case: bool,
+}
+// Code Duplicated from alerts
+impl RoutingCondition {
+    pub async fn evaluate(&self, row: &Map<String, Value>) -> bool {
+        let val = match row.get(&self.column) {
+            Some(val) => val,
+            None => {
+                return false;
+            }
+        };
+        match val {
+            Value::String(v) => {
+                let val = v.as_str();
+                let con_val = self.value.as_str().unwrap_or_default();
+                match self.operator {
+                    Operator::EqualTo => val == con_val,
+                    Operator::NotEqualTo => val != con_val,
+                    Operator::GreaterThan => val > con_val,
+                    Operator::GreaterThanEquals => val >= con_val,
+                    Operator::LessThan => val < con_val,
+                    Operator::LessThanEquals => val <= con_val,
+                    Operator::Contains => val.contains(con_val),
+                    Operator::NotContains => !val.contains(con_val),
+                }
+            }
+            Value::Number(_) => {
+                let val = val.as_f64().unwrap_or_default();
+                let con_val = if self.value.is_number() {
+                    self.value.as_f64().unwrap_or_default()
+                } else {
+                    self.value
+                        .as_str()
+                        .unwrap_or_default()
+                        .parse()
+                        .unwrap_or_default()
+                };
+                match self.operator {
+                    Operator::EqualTo => val == con_val,
+                    Operator::NotEqualTo => val != con_val,
+                    Operator::GreaterThan => val > con_val,
+                    Operator::GreaterThanEquals => val >= con_val,
+                    Operator::LessThan => val < con_val,
+                    Operator::LessThanEquals => val <= con_val,
+                    _ => false,
+                }
+            }
+            Value::Bool(v) => {
+                let val = v.to_owned();
+                let con_val = if self.value.is_boolean() {
+                    self.value.as_bool().unwrap_or_default()
+                } else {
+                    self.value
+                        .as_str()
+                        .unwrap_or_default()
+                        .parse()
+                        .unwrap_or_default()
+                };
+                match self.operator {
+                    Operator::EqualTo => val == con_val,
+                    Operator::NotEqualTo => val != con_val,
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub enum Operator {
+    #[serde(rename = "=")]
+    EqualTo,
+    #[serde(rename = "!=")]
+    NotEqualTo,
+    #[serde(rename = ">")]
+    GreaterThan,
+    #[serde(rename = ">=")]
+    GreaterThanEquals,
+    #[serde(rename = "<")]
+    LessThan,
+    #[serde(rename = "<=")]
+    LessThanEquals,
+    Contains,
+    NotContains,
+}
+
+impl Default for Operator {
+    fn default() -> Self {
+        Self::EqualTo
+    }
+}
+
+impl std::fmt::Display for Operator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Operator::EqualTo => write!(f, "="),
+            Operator::NotEqualTo => write!(f, "!="),
+            Operator::GreaterThan => write!(f, ">"),
+            Operator::GreaterThanEquals => write!(f, ">="),
+            Operator::LessThan => write!(f, "<"),
+            Operator::LessThanEquals => write!(f, "<="),
+            Operator::Contains => write!(f, "contains"),
+            Operator::NotContains => write!(f, "not contains"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -406,5 +764,33 @@ mod tests {
         let rpc_meta = cluster_rpc::FileMeta::from(&file_meta);
         let resp = FileMeta::from(&rpc_meta);
         assert_eq!(file_meta, resp);
+    }
+
+    #[test]
+    fn test_hash_partition() {
+        let part = StreamPartition::new("field");
+        assert_eq!(
+            json::to_string(&part).unwrap(),
+            r#"{"field":"field","types":"value","disabled":false}"#
+        );
+        let part = StreamPartition::new_hash("field", 32);
+        assert_eq!(
+            json::to_string(&part).unwrap(),
+            r#"{"field":"field","types":{"hash":32},"disabled":false}"#
+        );
+
+        for key in &[
+            "hello", "world", "foo", "bar", "test", "test1", "test2", "test3",
+        ] {
+            println!("{}: {}", key, part.get_partition_key(key));
+        }
+        assert_eq!(part.get_partition_key("hello"), "field=20");
+        assert_eq!(part.get_partition_key("world"), "field=13");
+        assert_eq!(part.get_partition_key("foo"), "field=21");
+        assert_eq!(part.get_partition_key("bar"), "field=4");
+        assert_eq!(part.get_partition_key("test"), "field=10");
+        assert_eq!(part.get_partition_key("test1"), "field=21");
+        assert_eq!(part.get_partition_key("test2"), "field=18");
+        assert_eq!(part.get_partition_key("test3"), "field=6");
     }
 }

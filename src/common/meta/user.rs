@@ -303,6 +303,9 @@ pub struct SignInResponse {
 pub struct TokenValidationResponse {
     pub is_valid: bool,
     pub user_email: String,
+    pub user_name: String,
+    pub family_name: String,
+    pub given_name: String,
     pub is_internal_user: bool,
     pub user_role: Option<UserRole>,
 }
@@ -338,4 +341,10 @@ pub struct UserRoleRequest {
 pub struct RolesResponse {
     pub label: String,
     pub value: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, ToSchema)]
+pub struct AuthTokens {
+    pub access_token: String,
+    pub refresh_token: String,
 }

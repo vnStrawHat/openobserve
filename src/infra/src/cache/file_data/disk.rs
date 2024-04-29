@@ -64,7 +64,7 @@ impl FileData {
         }
     }
 
-    async fn exist(&mut self, file: &str) -> bool {
+    async fn exist(&self, file: &str) -> bool {
         self.data.contains_key(file)
     }
 
@@ -175,10 +175,11 @@ impl FileData {
 
 pub async fn init() -> Result<(), anyhow::Error> {
     let root_dir = FILES.read().await.root_dir.clone();
-    let root_dir = Path::new(&root_dir).canonicalize().unwrap();
     std::fs::create_dir_all(&root_dir).expect("create cache dir success");
+
     tokio::task::spawn(async move {
         log::info!("Loading disk cache start");
+        let root_dir = Path::new(&root_dir).canonicalize().unwrap();
         if let Err(e) = load(&root_dir, &root_dir).await {
             log::error!("load disk cache error: {}", e);
         }
@@ -217,7 +218,7 @@ pub async fn exist(file: &str) -> bool {
     if !CONFIG.disk_cache.enabled {
         return false;
     }
-    let mut files = FILES.write().await;
+    let files = FILES.read().await;
     files.exist(file).await
 }
 
@@ -288,10 +289,10 @@ async fn load(root_dir: &PathBuf, scan_dir: &PathBuf) -> Result<(), anyhow::Erro
                     let columns = file_key.split('/').collect::<Vec<&str>>();
                     metrics::QUERY_DISK_CACHE_FILES
                         .with_label_values(&[columns[1], columns[2]])
-                        .dec();
+                        .inc();
                     metrics::QUERY_DISK_CACHE_USED_BYTES
                         .with_label_values(&[columns[1], columns[2]])
-                        .sub(data_size as i64);
+                        .add(data_size as i64);
                 }
             }
         }
