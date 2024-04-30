@@ -51,7 +51,9 @@
     "actions": "Actions",
     "type": "Type",
     "search": "Search",
-    "expand": "Expand"
+    "expand": "Expand",
+    "url": "URL",
+    "send": "Send"
   },
   "search": {
     "selectIndex": "Select Stream First",
@@ -136,7 +138,8 @@
     "rum": "Real User Monitoring",
     "settings": "Settings",
     "iam": "IAM",
-    "report": "Reports"
+    "report": "Reports",
+    "synthetics": "Synthetics"
   },
   "rum": {
     "title": "Real User Monitoring",
@@ -829,5 +832,9 @@
     "description": "Description",
     "cron": "Cron Job",
     "cronExpression": "Cron expression"
+  },
+  "synthetics": {
+    "header": "Synthetics",
+    "requestType": "Request Type"
   }
 }
