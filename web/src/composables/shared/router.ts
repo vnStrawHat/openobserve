@@ -45,6 +45,7 @@ const ErrorViewer = () => import("@/views/RUM/ErrorViewer.vue");
 const AppPerformance = () => import("@/views/RUM/AppPerformance.vue");
 const AppErrors = () => import("@/views/RUM/AppErrors.vue");
 const AppSessions = () => import("@/views/RUM/AppSessions.vue");
+const SyntheticMonitoring = () => import("@/views/RUM/SyntheticMonitoring.vue");
 
 const ReportList = () => import("@/components/reports/ReportList.vue");
 const CreateReport = () => import("@/components/reports/CreateReport.vue");
@@ -62,6 +63,7 @@ import { routeGuard } from "@/utils/zincutils";
 import useIngestionRoutes from "./useIngestionRoutes";
 import useIamRoutes from "./useIamRoutes";
 import config from "@/aws-exports";
+import { S } from "msw/lib/SetupApi-8ab693f7";
 
 const useRoutes = () => {
   const parentRoutes: never[] = [];
@@ -390,6 +392,17 @@ const useRoutes = () => {
               },
             },
           ],
+        },
+        {
+          path: "syntehtic-monitoring",
+          name: "SyntheticMonitoring",
+          component: SyntheticMonitoring,
+          meta: {
+            keepAlive: true,
+          },
+          beforeEnter(to: any, from: any, next: any) {
+            routeGuard(to, from, next);
+          },
         },
       ],
     },
