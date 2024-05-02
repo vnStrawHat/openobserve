@@ -30,6 +30,7 @@ use crate::{
         maxmind::MaxmindClient,
         organization::OrganizationSetting,
         prom::ClusterLeader,
+        synthetics,
         syslog::SyslogRoute,
         user::User,
     },
@@ -68,6 +69,8 @@ pub static ALERTS_TEMPLATES: Lazy<RwHashMap<String, alerts::templates::Template>
 pub static ALERTS_DESTINATIONS: Lazy<RwHashMap<String, alerts::destinations::Destination>> =
     Lazy::new(Default::default);
 pub static DASHBOARD_REPORTS: Lazy<RwHashMap<String, reports::Report>> =
+    Lazy::new(Default::default);
+pub static SYNTHETICS: Lazy<RwHashMap<String, synthetics::Synthetics>> =
     Lazy::new(Default::default);
 pub static SYSLOG_ROUTES: Lazy<RwHashMap<String, SyslogRoute>> = Lazy::new(Default::default);
 pub static SYSLOG_ENABLED: Lazy<Arc<RwLock<bool>>> = Lazy::new(|| Arc::new(RwLock::new(false)));
