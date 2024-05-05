@@ -1685,6 +1685,7 @@ export default defineComponent({
               delete extractedObj.data.stream.selectedStream;
               delete searchObj.data.stream.selectedStream;
               delete searchObj.data.queryResults.aggs;
+              delete searchObj.data.stream.interestingFieldList;
               searchObj.data.stream.selectedStream = [];
               extractedObj.data.transforms = searchObj.data.transforms;
               extractedObj.data.stream.functions =
