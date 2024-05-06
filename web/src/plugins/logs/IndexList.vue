@@ -939,6 +939,8 @@ export default defineComponent({
           useLocalInterestingFields(localStreamFields);
         }
       }
+
+      emit("setInterestingFieldInSQLQuery", field, isInterestingField);
     };
 
     const sortedStreamFields = () => {
